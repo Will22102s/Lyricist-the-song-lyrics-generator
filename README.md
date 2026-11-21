@@ -4,7 +4,7 @@
   <img src="assets/preview.png" alt="Lyricist UI Preview" width="800"/>
 </p>
 
-# Lyricist 
+# Lyricist - The Song Lyrics Generator🎵️
 
 Desktop app (Windows + Linux) that writes **synced `.lrc` lyrics** next to your music.
 It searches first, listens second and guesses last:
