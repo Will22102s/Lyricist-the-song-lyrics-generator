@@ -1,3 +1,9 @@
+## 🖥️ App Preview
+
+<p align="center">
+  <img src="assets/preview.png" alt="Lyricist UI Preview" width="800"/>
+</p>
+
 # Local Sync Lyrics
 
 Desktop app (Windows + Linux) that writes **synced `.lrc` lyrics** next to your music.
