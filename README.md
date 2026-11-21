@@ -1,4 +1,4 @@
-# Local Sync Lyrics
+# Lyricist - the song lyrics generator 🎼🎵🎶
 
 Desktop app (Windows + Linux) that writes **synced `.lrc` lyrics** next to your music.
 It searches first, listens second and guesses last:
