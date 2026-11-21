@@ -1,0 +1,4 @@
+-r requirements.txt
+flet-cli>=1.1,<2      # provides `flet pack`
+pyinstaller>=6.6
+pytest>=8.0
