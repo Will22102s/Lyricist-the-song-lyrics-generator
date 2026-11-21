@@ -8,7 +8,7 @@ It searches first, listens second and guesses last:
   <img src="assets/preview.png" alt="Lyricist UI Preview" width="800"/>
 </p>
 
-# How it works
+## How it works
 
 ```
 Tier 1  synced providers   LRCLIB → BetterLyrics → RCLyricsBand → Megalobiz → NetEase → QQ Music   → save .lrc
@@ -19,7 +19,7 @@ Align   official words + Whisper word timestamps → forced alignment → .lrc w
 Blind   only if no text exists anywhere (or the alignment is too weak to trust) → plain Whisper
 ```
 
-# How to use
+## How to use
 
 ```
 python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
