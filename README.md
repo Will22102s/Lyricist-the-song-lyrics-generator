@@ -8,6 +8,8 @@ It searches first, listens second and guesses last:
   <img src="assets/preview.png" alt="Lyricist UI Preview" width="800"/>
 </p>
 
+# How it works
+
 ```
 Tier 1  synced providers   LRCLIB → BetterLyrics → RCLyricsBand → Megalobiz → NetEase → QQ Music   → save .lrc
 Mashup  "A x B", "A / B", "A & B (Mashup)", "A vs B"  → split into songs, fetch each one's lyrics
@@ -16,6 +18,8 @@ Listen  nothing found / a song unnamed → blind-listen to slices, search lyric 
 Align   official words + Whisper word timestamps → forced alignment → .lrc with the OFFICIAL spelling
 Blind   only if no text exists anywhere (or the alignment is too weak to trust) → plain Whisper
 ```
+
+# How to use
 
 ```
 python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
