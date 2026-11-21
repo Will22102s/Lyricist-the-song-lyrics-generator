@@ -7,6 +7,7 @@ It searches first, listens second and guesses last:
 <p align="center">
   <img src="assets/preview.png" alt="Lyricist UI Preview" width="800"/>
 </p>
+
 ```
 Tier 1  synced providers   LRCLIB → BetterLyrics → RCLyricsBand → Megalobiz → NetEase → QQ Music   → save .lrc
 Mashup  "A x B", "A / B", "A & B (Mashup)", "A vs B"  → split into songs, fetch each one's lyrics
