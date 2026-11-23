@@ -190,5 +190,5 @@ The ≥ 40 % alignment quality gate and the 35 % “Your Own Lyrics” similarit
 ## License
 
 This project is licensed under the Apache License 2.0.
-See the [LICENSE] file for the full text.
+See the LICENSE file for the full text.
 ```
