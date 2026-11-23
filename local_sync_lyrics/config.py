@@ -62,6 +62,79 @@ WHISPER_MODELS = (
     "auto", "tiny", "base", "small", "medium", "large-v3-turbo", "large-v3",
 )
 
+# --- custom providers ----------------------------------------------------------------
+CUSTOM_PROVIDER_TYPES = ("lrc", "json")
+MAX_CUSTOM_PROVIDERS = 50
+
+
+@dataclass
+class CustomProvider:
+    """A user-defined lyrics endpoint (Phase 3).
+
+    ``url_template`` may contain ``{artist}``, ``{title}`` and ``{album}``; the values are
+    URL-quoted before substitution. ``response_type`` is ``lrc`` (the response body *is*
+    an LRC document) or ``json`` (extract the lyrics with ``json_lyrics_path``, a
+    dot-separated path such as ``data.lyrics``).
+    """
+
+    name: str = ""
+    enabled: bool = True
+    url_template: str = ""
+    response_type: str = "lrc"
+    json_lyrics_path: str = ""
+
+    @property
+    def slug(self) -> str:
+        return f"custom:{self.name.strip().casefold()}"
+
+    def valid(self) -> bool:
+        """True when the entry could actually be queried."""
+        url = self.url_template.strip()
+        return bool(self.name.strip()) and url.startswith(("http://", "https://")) and (
+            "{title}" in url or "{artist}" in url)
+
+    def normalised(self) -> "CustomProvider":
+        return CustomProvider(
+            name=self.name.strip()[:60],
+            enabled=bool(self.enabled),
+            url_template=self.url_template.strip(),
+            response_type=(self.response_type or "lrc").strip().lower()
+            if (self.response_type or "").strip().lower() in CUSTOM_PROVIDER_TYPES else "lrc",
+            json_lyrics_path=self.json_lyrics_path.strip(),
+        )
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "CustomProvider":
+        if not isinstance(raw, dict):
+            return cls()
+        return cls(
+            name=str(raw.get("name", "") or ""),
+            enabled=bool(raw.get("enabled", True)),
+            url_template=str(raw.get("url_template", "") or ""),
+            response_type=str(raw.get("response_type", "lrc") or "lrc"),
+            json_lyrics_path=str(raw.get("json_lyrics_path", "") or ""),
+        ).normalised()
+
+    def to_dict(self) -> dict[str, Any]:
+        provider = self.normalised()
+        return {
+            "name": provider.name,
+            "enabled": provider.enabled,
+            "url_template": provider.url_template,
+            "response_type": provider.response_type,
+            "json_lyrics_path": provider.json_lyrics_path,
+        }
+
+
+# --- tagging --------------------------------------------------------------------------
+TAG_MODES = ("fill_missing", "overwrite_all")
+TAG_MODE_LABELS = {
+    "fill_missing": "Fill Missing",
+    "overwrite_all": "Overwrite",
+}
+DEFAULT_TAG_MODE = "fill_missing"
+
+
 # --- output ---------------------------------------------------------------------------
 OUTPUT_MODES = ("lrc", "embed", "both")
 OUTPUT_MODE_LABELS = {
@@ -151,6 +224,11 @@ class Settings:
     save_plain_fallback: bool = False    # write unsynced lyrics to .txt if nothing synced
     output_mode: str = DEFAULT_OUTPUT_MODE   # lrc | embed | both
 
+    # --- Phase 3: custom providers + auto-tagging --------------------------
+    custom_providers: list[CustomProvider] = field(default_factory=list)
+    auto_tag: bool = False               # look up MusicBrainz/iTunes and write tags + cover
+    tag_mode: str = DEFAULT_TAG_MODE     # fill_missing | overwrite_all
+
     # --- UI / bookkeeping --------------------------------------------------
     last_folder: str = ""
     theme_mode: str = "dark"             # dark | light | system
@@ -225,6 +303,13 @@ class Settings:
         for f in fields(cls):
             if f.name.startswith("_") or f.name not in raw:
                 continue
+            if f.name == "custom_providers":
+                entries = raw[f.name] if isinstance(raw[f.name], (list, tuple)) else []
+                settings.custom_providers = [
+                    CustomProvider.from_dict(entry) for entry in entries
+                    if isinstance(entry, dict)
+                ]
+                continue
             default = (
                 f.default if f.default is not MISSING else f.default_factory()  # type: ignore[misc]
             )
@@ -259,6 +344,14 @@ class Settings:
         self.musixmatch_key = self.musixmatch_key.strip()
         if self.output_mode not in OUTPUT_MODES:
             self.output_mode = DEFAULT_OUTPUT_MODE
+        if self.tag_mode not in TAG_MODES:
+            self.tag_mode = DEFAULT_TAG_MODE
+        providers: list[CustomProvider] = []
+        for entry in self.custom_providers or []:
+            provider = entry if isinstance(entry, CustomProvider) else CustomProvider.from_dict(entry)
+            if provider.valid():
+                providers.append(provider.normalised())
+        self.custom_providers = providers[:MAX_CUSTOM_PROVIDERS]
         if self.theme_mode not in THEME_MODES:
             self.theme_mode = "dark"
         self.custom_accent = normalise_hex(self.custom_accent, DEFAULT_ACCENT)

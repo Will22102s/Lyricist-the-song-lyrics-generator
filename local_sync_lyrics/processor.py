@@ -49,14 +49,16 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from .api_providers import LyricsFetcher
+from .api_providers import TAG_TAGS, LyricsFetcher, MetadataClient
 from .config import CUSTOM_LYRICS_MIN_MATCH, Settings
 from .database import LyricsDatabase, TrackRecord, fingerprint_file
 from .language import LanguageGuess, detect_text_language
 from .lrc_utils import (
     MatchReport, match_lyrics, plain_to_lines, strip_to_plain, validate_synced, write_text_atomic,
 )
-from .metadata import EmbedResult, embed_lyrics, has_embedded_lyrics, read_track_info
+from .metadata import (
+    EmbedResult, embed_lyrics, has_embedded_lyrics, read_track_info, write_tags,
+)
 from .models import (
     BatchSummary, Event, ReferenceComponent, ReferenceScript, Status, TrackInfo,
 )
@@ -114,6 +116,7 @@ class BatchProcessor:
         self.ask = ask          # headless callers leave this None: questions are answered "no"
         self._fetcher = fetcher
         self._transcriber = transcriber
+        self._metadata_client: Optional[MetadataClient] = None
         self.summary = BatchSummary()
         self._ai_down: Optional[str] = None   # set once the Whisper model is unusable
 
@@ -154,6 +157,11 @@ class BatchProcessor:
             self._transcriber = Transcriber(self.settings, log=self.log, cancel=self.cancel,
                                             on_language=self._on_language)
         return self._transcriber
+
+    def _get_metadata_client(self) -> MetadataClient:
+        if self._metadata_client is None:
+            self._metadata_client = MetadataClient(timeout=self.settings.request_timeout)
+        return self._metadata_client
 
     def _on_language(self, guess: LanguageGuess) -> None:
         """Tell the UI which language Whisper is now locked to (``data={}`` clears the badge)."""
@@ -258,7 +266,7 @@ class BatchProcessor:
         return self.summary
 
     def _shutdown(self) -> None:
-        for resource in (self._fetcher, self._transcriber):
+        for resource in (self._fetcher, self._transcriber, self._metadata_client):
             try:
                 if resource is not None:
                     resource.close()
@@ -267,7 +275,7 @@ class BatchProcessor:
 
     # ----------------------------------------------------------- cache helpers
     def _log_output_mode(self) -> None:
-        from .config import OUTPUT_MODE_LABELS
+        from .config import OUTPUT_MODE_LABELS, TAG_MODE_LABELS
 
         s = self.settings
         extras = []
@@ -275,6 +283,8 @@ class BatchProcessor:
             extras.append("vocal isolation ON")
         if not s.detect_language:
             extras.append("language detection OFF")
+        if s.auto_tag:
+            extras.append(f"auto-tag {TAG_MODE_LABELS.get(s.tag_mode, s.tag_mode)}")
         self.log(TAG_OUTPUT, f"{OUTPUT_MODE_LABELS.get(s.output_mode, s.output_mode)}"
                  + (f" · {', '.join(extras)}" if extras else ""))
 
@@ -323,8 +333,24 @@ class BatchProcessor:
 
     # ------------------------------------------------------------ one track
     def process_track(self, path: Path) -> Status:
-        lrc_path = path.with_suffix(".lrc")
+        """Resolve lyrics, then (Phase 3) optionally complete the file's tags."""
         fingerprint = fingerprint_file(path)
+        status = self._process_track(path, fingerprint)
+        if self.settings.auto_tag:
+            try:
+                track = read_track_info(path)
+                # Lyrics embedding may already have moved the cache key; re-key from the
+                # file's *current* fingerprint so tag writing cannot leave a stale entry.
+                current = fingerprint_file(path)
+                if self._auto_tag(path, track):
+                    self.db.rekey(current, fingerprint_file(path))
+            except Exception as exc:  # tagging must never change the lyrics outcome
+                logger.debug("auto-tag failed for %s", path, exc_info=True)
+                self.log(TAG_TAGS, f"{path.name}: {exc.__class__.__name__}: {exc}", "warning")
+        return status
+
+    def _process_track(self, path: Path, fingerprint: str) -> Status:
+        lrc_path = path.with_suffix(".lrc")
         record = self.db.get(fingerprint)
 
         need_lrc, need_embed = self._outputs_needed(path, lrc_path)
@@ -352,6 +378,44 @@ class BatchProcessor:
             session = holder.get("session")
             if session is not None:
                 session.close()   # frees the decoded audio before the next track
+
+    # ------------------------------------------------------------- auto-tagging
+    def _auto_tag(self, path: Path, track: TrackInfo) -> bool:
+        """Look up canonical tags + cover art and write them. Returns True when changed."""
+        client = self._get_metadata_client()
+        self.log(TAG_TAGS, f"Looking up tags for “{track.display_name}”…")
+        try:
+            meta = client.lookup(track.artist, track.title, track.album, track.duration)
+        except Exception as exc:  # network/parse failures are never fatal
+            logger.debug("metadata lookup failed for %s", path, exc_info=True)
+            self.log(TAG_TAGS, f"No tag match ({exc.__class__.__name__}: {exc})", "warning")
+            return False
+        if meta is None or meta.is_empty():
+            self.log(TAG_TAGS, "No tag match found", "warning")
+            return False
+        if self.cancel.is_set():
+            return False
+        try:
+            result = write_tags(path, meta, mode=self.settings.tag_mode)
+        except Exception as exc:  # write_tags already guards; belt and braces
+            logger.debug("tag write failed for %s", path, exc_info=True)
+            self.log(TAG_TAGS, f"Could not write tags: {exc.__class__.__name__}", "warning")
+            return False
+        if not result.ok:
+            self.log(TAG_TAGS, f"Could not write tags to {path.name}: {result.message}", "warning")
+            return False
+        if result.fields or result.cover_written:
+            mode = "overwritten" if self.settings.tag_mode == "overwrite_all" else "completed"
+            self.log("OK", f"Tags {mode} for {path.name} via {meta.source}: {result.describe()}")
+            try:
+                self.emit(Event("tagged", message=path.name, data={
+                    "path": str(path), "fields": result.fields,
+                    "cover": result.cover_written, "source": meta.source}))
+            except Exception:
+                logger.exception("emit failed")
+            return True
+        self.log(TAG_TAGS, f"{path.name}: tags were already complete")
+        return False
 
     # ------------------------------------------------------------- the pipeline
     def _resolve(self, path: Path, lrc_path: Path, fingerprint: str, track: TrackInfo,
@@ -668,6 +732,16 @@ class BatchProcessor:
         else:
             self.log("WARN", f"Could not embed lyrics into {path.name}: {result.message}", "warning")
 
+    def _announce_saved(self, path: Path, lrc_text: str, status: Status, source: str) -> None:
+        """Tell the GUI which file now has editable lyrics (Phase 3 completion card)."""
+        try:
+            self.emit(Event("saved", message=path.name, data={
+                "path": str(path), "lrc": lrc_text,
+                "status": status.value if isinstance(status, Status) else str(status),
+                "source": source}))
+        except Exception:  # a broken UI callback must never kill the batch
+            logger.exception("emit failed")
+
     @staticmethod
     def _fingerprint_after(path: Path, before: str, embedded: Optional[EmbedResult]) -> str:
         """Tagging rewrites the head of the file, so the cache key must be recomputed."""
@@ -692,6 +766,7 @@ class BatchProcessor:
         result = embed_lyrics(path, text, language=self._text_language(strip_to_plain(text)))
         if result.ok:
             self.log("OK", f"Embedded the existing {lrc_path.name} into {path.name} ({result.describe()})")
+            self._announce_saved(path, text, Status.SKIPPED, f"embedded {lrc_path.name}")
         else:
             self._log_embed(path, result)
         return Status.SKIPPED
@@ -719,6 +794,7 @@ class BatchProcessor:
                 wrote_lrc = True
         self._record(self._fingerprint_after(path, fingerprint, embedded), track, status,
                      source=source, lrc_path=lrc_path if wrote_lrc else None, ai_tried=ai_tried)
+        self._announce_saved(path, lrc_text, status, source)
         return status
 
     def _write_lrc_file(self, lrc_path: Path, lrc_text: str, source: str) -> None:

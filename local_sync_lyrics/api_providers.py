@@ -49,12 +49,12 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from .config import Settings
+from .config import CustomProvider, Settings
 from .lrc_utils import (
     build_lrc, clean_plain_lyrics, drop_credit_lines, looks_like_lyrics, parse_lrc,
     parse_ttml, strip_to_plain, validate_synced,
 )
-from .models import IdentifiedSong, LyricsResult, MatchKind, TrackInfo
+from .models import IdentifiedSong, LyricsResult, MatchKind, TrackInfo, TrackMetadata
 from .text_utils import query_variants, similarity
 
 logger = logging.getLogger(__name__)
@@ -68,6 +68,8 @@ LogFn = Callable[[str, str, str], None]  # (tag, message, level)
 
 TAG_T1 = "API: Tier 1"
 TAG_PLAIN = "API: Plain Text"
+TAG_CUSTOM = "API: Custom"
+TAG_TAGS = "Tags"
 _TRANSLATION_RE = re.compile(
     r"(?:translation|traduc|romaniz|übersetzung|tradução|çeviri|перевод|traduzione)",
     re.IGNORECASE)
@@ -239,6 +241,28 @@ def _soup(text: str):
     except ImportError as exc:  # pragma: no cover - dependency guard
         raise ProviderError("beautifulsoup4 is not installed") from exc
     return BeautifulSoup(text, "html.parser")
+
+
+def _dot_get(value, path: str):
+    """Follow a dot path (``data.lyrics``, ``items.0.text``) through dicts/lists."""
+    current = value
+    for part in [p.strip() for p in str(path or "").split(".") if p.strip()]:
+        if isinstance(current, dict):
+            if part not in current:
+                return None
+            current = current[part]
+        elif isinstance(current, list):
+            try:
+                current = current[int(part)]
+            except (ValueError, IndexError):
+                return None
+        else:
+            return None
+    if isinstance(current, str):
+        return current
+    if isinstance(current, (int, float)):
+        return str(current)
+    return None
 
 
 # ------------------------------------------------------------------ providers
@@ -842,6 +866,78 @@ class MusixmatchProvider(LyricsProvider):
         return out
 
 
+class CustomLyricsProvider(LyricsProvider):
+    """A user-configured endpoint (Phase 3).
+
+    Configured in Settings -> Custom Providers. The response is either an LRC document
+    (``response_type="lrc"``) or JSON whose lyrics live at ``json_lyrics_path``. Every
+    failure is a :class:`ProviderError`, so a broken endpoint only costs that provider.
+    """
+
+    tier = 1
+    min_interval = 0.0
+
+    def __init__(self, http: HttpClient, settings: Settings, entry: CustomProvider) -> None:
+        super().__init__(http, settings)
+        self.entry = entry.normalised()
+        self.id = self.entry.slug
+        self.label = self.entry.name or "Custom"
+
+    def available(self) -> bool:
+        return bool(self.entry.enabled and self.entry.valid())
+
+    def _url(self, query: TrackQuery) -> str:
+        artist, title = query.primary
+        values = {
+            "artist": quote(artist or ""),
+            "title": quote(title or ""),
+            "album": quote(query.album or ""),
+        }
+        try:
+            url = self.entry.url_template.format(**values)
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ProviderError(f"bad URL template ({exc.__class__.__name__}: {exc})") from exc
+        if not url.startswith(("http://", "https://")):
+            raise ProviderError("the URL template must start with http:// or https://")
+        return url
+
+    def search(self, query: TrackQuery) -> Optional[LyricsResult]:
+        self._throttle()
+        response = self.http.get(
+            self._url(query),
+            headers={"Accept": "text/plain, application/json, */*"})
+        if response is None:
+            return None
+        if self.entry.response_type == "json":
+            payload = _json_of(response)
+            text = _dot_get(payload, self.entry.json_lyrics_path)
+            if not text and not self.entry.json_lyrics_path:
+                text = payload if isinstance(payload, str) else None
+            if not text:
+                raise ProviderError(
+                    f"JSON has no text at “{self.entry.json_lyrics_path or '(root)'}”")
+        else:
+            text = _as_text(getattr(response, "text", "")).strip()
+        if not text:
+            return None
+
+        artist, title = query.primary
+        lines = parse_lrc(text)
+        if lines:
+            lrc = build_lrc(lines, artist=artist, title=title, album=query.album,
+                            duration=query.duration, source=self.label)
+            ok, reason, _ = validate_synced(lrc, query.duration)
+            if not ok:
+                raise ProviderError(f"the LRC response was rejected ({reason})")
+            return LyricsResult(provider=self.label, synced_lrc=lrc, artist=artist,
+                                title=title, score=100.0, tier=1)
+        plain = clean_plain_lyrics(text)
+        if looks_like_lyrics(plain):
+            return LyricsResult(provider=self.label, plain=plain, artist=artist,
+                                title=title, score=100.0, tier=1)
+        return None
+
+
 PROVIDER_CLASSES: dict[str, type[LyricsProvider]] = {
     cls.id: cls for cls in (
         LrclibProvider, BetterLyricsProvider, RcLyricsBandProvider, MegalobizProvider,
@@ -900,6 +996,10 @@ class LyricsFetcher:
                 continue
             provider = cls(self.http, settings)
             (self.providers if provider.available() else skipped).append(provider)
+        for entry in settings.custom_providers:            # Phase 3: user endpoints last
+            provider = CustomLyricsProvider(self.http, settings, entry)
+            if provider.available():
+                self.providers.append(provider)
         for provider in skipped:
             self._log(TAG_PLAIN, f"{provider.label} skipped (no API key configured)", "info")
 
@@ -1008,3 +1108,276 @@ class LyricsFetcher:
                     seen.add(key)
                     found.append(song)
         return found
+
+
+# =============================================================== Phase 3: tagging
+MUSICBRAINZ_API = "https://musicbrainz.org/ws/2"
+COVER_ART_ARCHIVE = "https://coverartarchive.org"
+ITUNES_API = "https://itunes.apple.com/search"
+COVER_MAX_BYTES = 8 * 1024 * 1024
+_ITUNES_SIZE_RE = re.compile(r"\d+x\d+bb")
+
+
+def test_custom_provider(entry: CustomProvider, artist: str = "Coldplay",
+                         title: str = "Yellow", *, timeout: float = 12.0) -> str:
+    """Query one custom endpoint (for the Settings "Test" button).
+
+    Returns a short human summary; raises :class:`ProviderError` when it fails.
+    """
+    http = HttpClient(timeout=timeout)
+    try:
+        probe = entry.normalised()
+        probe.enabled = True          # "Test" must work before the endpoint is enabled
+        provider = CustomLyricsProvider(http, Settings(), probe)
+        if not provider.available():
+            raise ProviderError("the endpoint is incomplete")
+        hit = provider.search(TrackQuery.from_names(artist, title))
+    finally:
+        http.close()
+    if hit is None:
+        raise ProviderError("connected, but no lyrics were found for the sample query")
+    if hit.synced_lrc:
+        return (f"OK - synced lyrics ({len(parse_lrc(hit.synced_lrc))} lines) "
+                f"for {artist} - {title}")
+    lines = len((hit.plain or "").splitlines())
+    return f"OK - plain text ({lines} lines) for {artist} - {title}"
+
+
+def _mb_artist(credit) -> str:
+    """Join a MusicBrainz artist-credit array into one display string."""
+    if not isinstance(credit, list):
+        return ""
+    names = []
+    for entry in credit:
+        if not isinstance(entry, dict):
+            continue
+        name = _as_text(entry.get("name")) or _as_text(_dig(entry, "artist", "name"))
+        if name:
+            names.append(name)
+    return ", ".join(names)
+
+
+def _best_genre(value) -> str:
+    """Pick the most-voted tag/genre name from a MusicBrainz list."""
+    entries = [e for e in _as_list(value) if isinstance(e, dict) and _as_text(e.get("name"))]
+    entries.sort(key=lambda e: e.get("count", 0) if isinstance(e.get("count"), int) else 0,
+                 reverse=True)
+    return _as_text(entries[0].get("name")) if entries else ""
+
+
+def _itunes_year(value: str) -> str:
+    match = re.match(r"(\d{4})", _as_text(value))
+    return match.group(1) if match else ""
+
+
+def _hi_res_artwork(url: str) -> str:
+    """iTunes serves 100 px art by default; the same asset exists at 1200 px."""
+    return _ITUNES_SIZE_RE.sub("1200x1200bb", _as_text(url))
+
+
+def _sniff_image(data: bytes) -> str:
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return ""
+
+
+class MetadataClient:
+    """Zero-API-key tag/artwork lookup: MusicBrainz + Cover Art Archive, iTunes fallback."""
+
+    def __init__(self, timeout: float = 12.0) -> None:
+        self.http = HttpClient(timeout=timeout)
+        self._last_mb = 0.0
+        self._lock = threading.Lock()
+
+    def close(self) -> None:
+        self.http.close()
+
+    # ------------------------------------------------------------------ helpers
+    def _mb_throttle(self) -> None:
+        with self._lock:
+            wait = 1.0 - (time.monotonic() - self._last_mb)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_mb = time.monotonic()
+
+    def download_cover(self, url: str) -> tuple[bytes, str]:
+        """Fetch cover bytes, rejecting HTML/oversized payloads. ``(b"", "")`` on failure."""
+        if not url:
+            return b"", ""
+        try:
+            response = self.http.get(url, headers={"Accept": "image/*"})
+        except ProviderError as exc:
+            logger.debug("cover download failed: %s", exc)
+            return b"", ""
+        if response is None:
+            return b"", ""
+        data = response.content or b""
+        if not data or len(data) > COVER_MAX_BYTES:
+            return b"", ""
+        mime = _sniff_image(data)
+        if not mime:                      # HTML error pages, truncated downloads, ...
+            return b"", ""
+        return data, mime
+
+    # -------------------------------------------------------------- MusicBrainz
+    def _from_musicbrainz(self, artist: str, title: str, album: str,
+                          duration: Optional[float]) -> Optional[TrackMetadata]:
+        terms = []
+        if title:
+            terms.append(f'recording:"{title}"')
+        if artist:
+            terms.append(f'artist:"{artist}"')
+        if not terms:
+            return None
+        self._mb_throttle()
+        payload = self.http.get_json(
+            f"{MUSICBRAINZ_API}/recording",
+            {"query": " AND ".join(terms), "fmt": "json", "limit": 6})
+        recordings = [r for r in _as_list(_dig(payload, "recordings")) if isinstance(r, dict)]
+        if not recordings:
+            return None
+
+        best, best_score = None, 0.0
+        for rec in recordings:
+            cand_artist = _mb_artist(rec.get("artist-credit"))
+            length = rec.get("length")
+            cand_duration = (float(length) / 1000.0
+                             if isinstance(length, (int, float)) and length > 0 else None)
+            score = score_candidate(TrackQuery.from_names(artist, title, duration),
+                                    cand_artist, _as_text(rec.get("title")), cand_duration)
+            if score > best_score:
+                best, best_score = rec, score
+        if best is None or best_score < 50:
+            return None
+
+        releases = [r for r in _as_list(best.get("releases")) if isinstance(r, dict)]
+        release = None
+        if releases:
+            release = next(
+                (r for r in releases if album and similarity(album, _as_text(r.get("title"))) >= 70),
+                releases[0])
+
+        genre = _best_genre(best.get("tags"))
+        if not genre and release is not None:
+            group = _dig(release, "release-group")
+            genre = _best_genre(_dig(group, "genres")) or _best_genre(_dig(group, "tags"))
+
+        track_number = 0
+        if release is not None:
+            media = _as_list(release.get("media"))
+            tracks = _as_list(_dig(media[0], "track")) if media else []
+            number = _as_text(_dig(tracks[0], "number")) if tracks else ""
+            match = re.match(r"(\d+)", number)
+            track_number = int(match.group(1)) if match else 0
+
+        year = ""
+        if release is not None:
+            year = _itunes_year(_as_text(release.get("date")))
+            if not year:
+                year = _itunes_year(_as_text(_dig(release, "release-group", "first-release-date")))
+
+        cover = ""
+        if release is not None and _as_text(release.get("id")):
+            cover = f"{COVER_ART_ARCHIVE}/release/{release['id']}/front-1200"
+
+        return TrackMetadata(
+            title=_as_text(best.get("title")) or title,
+            artist=_mb_artist(best.get("artist-credit")) or artist,
+            album=_as_text(release.get("title")) if release else album,
+            album_artist=(_mb_artist(release.get("artist-credit")) if release else "")
+            or _mb_artist(best.get("artist-credit")) or artist,
+            genre=genre,
+            year=year,
+            track_number=track_number,
+            cover_art_url=cover,
+            source="MusicBrainz",
+            score=best_score,
+        )
+
+    # ------------------------------------------------------------------- iTunes
+    def _from_itunes(self, artist: str, title: str, album: str,
+                     duration: Optional[float]) -> Optional[TrackMetadata]:
+        term = " ".join(part for part in (artist, title) if part) or title
+        if not term:
+            return None
+        payload = self.http.get_json(
+            ITUNES_API, {"term": term, "entity": "song", "limit": 8, "media": "music"})
+        results = [r for r in _as_list(_dig(payload, "results")) if isinstance(r, dict)]
+        best, best_score = None, 0.0
+        for item in results:
+            cand_duration = item.get("trackTimeMillis")
+            cand_duration = (float(cand_duration) / 1000.0
+                             if isinstance(cand_duration, (int, float)) and cand_duration > 0
+                             else None)
+            score = score_candidate(TrackQuery.from_names(artist, title, duration),
+                                    _as_text(item.get("artistName")),
+                                    _as_text(item.get("trackName")), cand_duration)
+            if score > best_score:
+                best, best_score = item, score
+        if best is None or best_score < 50:
+            return None
+        number = best.get("trackNumber")
+        return TrackMetadata(
+            title=_as_text(best.get("trackName")) or title,
+            artist=_as_text(best.get("artistName")) or artist,
+            album=_as_text(best.get("collectionName")) or album,
+            album_artist=_as_text(best.get("artistName")) or artist,
+            genre=_as_text(best.get("primaryGenreName")),
+            year=_itunes_year(_as_text(best.get("releaseDate"))),
+            track_number=int(number) if isinstance(number, (int, float)) else 0,
+            cover_art_url=_hi_res_artwork(_as_text(best.get("artworkUrl100"))),
+            source="iTunes",
+            score=best_score,
+        )
+
+    # ------------------------------------------------------------------ public
+    def lookup(self, artist: str, title: str, album: str = "",
+               duration: Optional[float] = None) -> Optional[TrackMetadata]:
+        """Best-effort canonical tags for one track (``None`` when nothing matches)."""
+        meta: Optional[TrackMetadata] = None
+        try:
+            meta = self._from_musicbrainz(artist, title, album, duration)
+        except (ProviderError, ValueError) as exc:
+            logger.debug("MusicBrainz lookup failed: %s", exc)
+        if meta is None:
+            try:
+                meta = self._from_itunes(artist, title, album, duration)
+            except (ProviderError, ValueError) as exc:
+                logger.debug("iTunes lookup failed: %s", exc)
+            return self._with_cover(meta)
+        if not meta.genre or not meta.cover_art_url:
+            try:
+                fallback = self._from_itunes(artist, title, album, duration)
+            except (ProviderError, ValueError):
+                fallback = None
+            if fallback is not None:
+                meta.genre = meta.genre or fallback.genre
+                meta.year = meta.year or fallback.year
+                meta.cover_art_url = meta.cover_art_url or fallback.cover_art_url
+                meta.track_number = meta.track_number or fallback.track_number
+                meta.album = meta.album or fallback.album
+        return self._with_cover(meta)
+
+    def _with_cover(self, meta: Optional[TrackMetadata]) -> Optional[TrackMetadata]:
+        if meta is None or not meta.cover_art_url:
+            return meta
+        data, mime = self.download_cover(meta.cover_art_url)
+        if not data and "/front-1200" in meta.cover_art_url:
+            data, mime = self.download_cover(meta.cover_art_url.replace("front-1200", "front-500"))
+        if data:
+            meta.cover, meta.cover_mime = data, mime
+        return meta
+
+
+def lookup_metadata(artist: str, title: str, album: str = "",
+                    duration: Optional[float] = None) -> Optional[TrackMetadata]:
+    """Convenience wrapper that owns (and closes) its HTTP session."""
+    client = MetadataClient()
+    try:
+        return client.lookup(artist, title, album, duration)
+    finally:
+        client.close()

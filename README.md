@@ -168,6 +168,36 @@ Log tags: `[Audio: Isolate]`, `[AI: Language]`, `[AI: Verify]`, `[Output]`.
 | 2 | Lyrics.ovh | – | direct lookup + Deezer-backed suggestions |
 | 2 | Musixmatch | API key | free plan returns excerpts → flagged partial; also identifies songs by lyric snippet |
 
+**Custom providers (Phase 3).** Settings → *Lyrics providers* → **Custom providers…** adds your own
+endpoints. Each entry has a name, an enable toggle, a URL template (`{artist}`, `{title}` and `{album}`
+are URL-encoded and substituted) and a response type: `lrc` (the body is an LRC document) or `json`
+(the lyrics are extracted with a dot path such as `data.lyrics` or `items.0.text`). Custom endpoints are
+queried **after** the built-ins, in list order, through the same timeout/exception-safe pipeline — a broken
+endpoint is logged and skipped and can never abort a batch. **Test** runs the endpoint against a sample
+query. The list lives in `settings.json` under `custom_providers`.
+
+## Manual editor, tags & artwork (Phase 3)
+
+**Lyric editor.** After a track is written, the workspace shows a non-blocking completion card
+(*View / Edit Lyrics* · *Done*). The editor is a modal `QDialog` with a two-column table
+(`Timestamp [mm:ss.xx]` · `Lyric line`) and a **Raw .lrc view** toggle that shares the same document.
+Toolbar: **Insert Line**, **Delete Line**, **Shift All Timestamps ±ms** (never below 00:00.00) and
+**Validate Timestamps** (normalises `[1:2:5]`, `[01:02,5]`, missing brackets; reports untimed text
+instead of inventing a time). **Save & Apply** writes the `.lrc` and/or re-embeds the lyrics
+(`USLT`/`SYLT` for MP3, `LYRICS` for FLAC/OGG/Opus, `©lyr` for M4A) according to the output mode, and
+refreshes an existing sidecar even in embed-only mode. The write runs on a thread-pool job, so the
+dialog never freezes.
+
+**Smart auto-tagger.** Toggle *Auto-tag & cover art* in the workspace (or Settings → *Tags & artwork*),
+then choose **Fill Missing** (default) or **Overwrite**. Lookups use **MusicBrainz** (1 request/s) with
+**Cover Art Archive** artwork and fall back to the **iTunes Search API** (artwork upgraded from
+`100x100bb` to `1200x1200bb`). No API key is needed. Written fields: title, artist, album, album artist,
+genre, year and track number, plus an embedded cover (`APIC` for MP3, `Picture` for FLAC, the
+`metadata_block_picture` comment for OGG/Opus, `covr` for M4A). *Fill Missing* keeps every value that
+already exists; *Overwrite* replaces them. Network and disk work happen on the existing background
+thread; a failed lookup or an unsupported container is logged, never fatal. Because writing tags changes
+the file's fingerprint, the cache entry is re-keyed afterwards. CLI: `--auto-tag [--tag-mode fill_missing|overwrite_all]`.
+
 ## Settings & environment variables
 
 Stored in `%APPDATA%\Lyricist\settings.json` / `~/.config/Lyricist/settings.json`
@@ -205,8 +235,8 @@ so edit the geometry there and re-run `python main.py --make-icons`.
 
 ## Verification status — please read
 
-Verified in a Linux sandbox (Python 3.13, PySide6 6.12, faster-whisper 1.2.1, PyAV 19, mutagen): **228 tests** (95 original
-pipeline/GUI + 29 Liquid Glass UI + 104 for Phase 2), the real Qt window built under the `offscreen` platform through
+Verified in a Linux sandbox (Python 3.13, PySide6 6.12, faster-whisper 1.2.1, PyAV 19, mutagen): **261 tests** (95 original
+pipeline/GUI + 29 Liquid Glass UI + 104 for Phase 2 + 33 for Phase 3), the real Qt window built under the `offscreen` platform through
 both views, all five accents, dark/light/system, the "Your Own Lyrics" dialog, the mismatch dialog and a simulated
 batch, the PyInstaller command line assembled by `build.py`, a 60-seed noise sweep of the aligner, and an end-to-end
 offline run of the real pipeline (log tags, graceful degradation). The Phase 2 tests were mutation-checked (breaking the
@@ -219,6 +249,15 @@ recognition errors); `VocalIsolator` was exercised against stand-ins that follow
 call contracts (stem naming, temp clean-up on every path, no model reload per track, offline / low-RAM / OOM / repeated-failure /
 Stop handling); language locking was verified to reach every `transcribe()` call, and the installed faster-whisper's
 `detect_language` signature is pinned by a test.
+
+Phase 3 specifics: tag and cover writing was exercised on **real MP3 / FLAC / OGG / Opus / M4A files** generated with PyAV
+(fill-missing vs overwrite, no-op second pass, unsupported WAV reported instead of raised, read-back of every field and
+the embedded cover); the editor's table/raw view round-trip, insert/delete/shift/validate and Save & Apply were driven
+through real widgets (a stubbed saver proved the signal path, and a real MP3 proved the `.lrc` + `USLT`/`SYLT` rewrite);
+custom providers were tested for URL quoting, LRC and JSON dot-path extraction, missing-path errors and the settings
+round-trip; the MusicBrainz → Cover Art Archive → iTunes fallback, high-res artwork rewrite, cover sniffing (HTML and
+oversized payloads rejected) and genre merge were covered with canned payloads. A live CLI run (`--cli --auto-tag`)
+filled `TPE2`/`TRCK` from MusicBrainz and embedded the lyrics.
 
 Aligner accuracy on **simulated** recognition errors (12 % misheard, 6 % dropped, 3 % hallucinated words),
 share of lines timestamped within 0.7 s of the truth, 80 random seeds:

@@ -298,3 +298,259 @@ def read_embedded_lyrics(path: Path) -> Optional[str]:
 
 def has_embedded_lyrics(path: Path) -> bool:
     return bool(read_embedded_lyrics(path))
+
+
+# ===================================================================== Phase 3 tags
+TAG_EXTENSIONS = MP3_EXTENSIONS | VORBIS_EXTENSIONS | MP4_EXTENSIONS
+
+
+@dataclass
+class TagWriteResult:
+    """Outcome of :func:`write_tags` (never raised, always returned)."""
+
+    ok: bool
+    supported: bool = True
+    fields: list[str] = field(default_factory=list)
+    cover_written: bool = False
+    message: str = ""
+
+    def describe(self) -> str:
+        parts = []
+        if self.fields:
+            parts.append(", ".join(self.fields))
+        if self.cover_written:
+            parts.append("cover art")
+        return "; ".join(parts) or self.message
+
+
+@dataclass
+class SaveLyricsResult:
+    """Outcome of :func:`save_lyrics` (the lyric editor's Save & Apply)."""
+
+    ok: bool
+    wrote_lrc: bool = False
+    embedded: Optional[EmbedResult] = None
+    message: str = ""
+
+    def describe(self) -> str:
+        parts = []
+        if self.wrote_lrc:
+            parts.append(".lrc updated")
+        if self.embedded is not None and self.embedded.ok:
+            parts.append(f"embedded ({self.embedded.describe()})")
+        if self.embedded is not None and not self.embedded.ok:
+            parts.append(self.embedded.message or "embedding failed")
+        return "; ".join(parts) or self.message
+
+
+def supports_tagging(path: Path) -> bool:
+    return Path(path).suffix.lower() in TAG_EXTENSIONS
+
+
+def _text_of(value: Any) -> str:
+    """String content of an ID3/MP4/Vorbis value (for fill-missing checks)."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return _text_of(value[0]) if value else ""
+    text = getattr(value, "text", None)
+    if text:
+        return _text_of(text)
+    return str(value).strip()
+
+
+def _wants(existing: Any, overwrite: bool) -> bool:
+    return overwrite or not _text_of(existing)
+
+
+def _write_mp3_tags(path: Path, meta: "TrackMetadata", cover: bytes, cover_mime: str,
+                    overwrite: bool) -> tuple[list[str], bool]:
+    from mutagen.id3 import (
+        APIC, ID3, TALB, TCON, TDRC, TIT2, TPE1, TPE2, TRCK, Encoding, ID3NoHeaderError,
+    )
+
+    try:
+        tags = ID3(str(path))
+    except ID3NoHeaderError:
+        tags = ID3()
+    fields: list[str] = []
+    frames = (
+        ("TIT2", TIT2, meta.title),
+        ("TPE1", TPE1, meta.artist),
+        ("TPE2", TPE2, meta.album_artist or meta.artist),
+        ("TALB", TALB, meta.album),
+        ("TCON", TCON, meta.genre),
+        ("TDRC", TDRC, meta.year),
+        ("TRCK", TRCK, str(meta.track_number) if meta.track_number else ""),
+    )
+    for frame_id, frame_cls, value in frames:
+        if not str(value).strip():
+            continue
+        if not _wants(tags.get(frame_id), overwrite):
+            continue
+        tags.setall(frame_id, [frame_cls(encoding=Encoding.UTF16, text=[str(value)])])
+        fields.append(frame_id)
+    cover_written = False
+    if cover and (overwrite or not tags.getall("APIC")):
+        tags.delall("APIC")
+        tags.add(APIC(encoding=Encoding.UTF8, mime=cover_mime or "image/jpeg", type=3,
+                      desc="Cover", data=cover))
+        cover_written = True
+    if fields or cover_written:
+        version = 3 if tuple(getattr(tags, "version", (2, 4, 0)))[:2] == (2, 3) else 4
+        tags.save(str(path), v2_version=version)
+    return fields, cover_written
+
+
+def _write_vorbis_tags(path: Path, meta: "TrackMetadata", cover: bytes, cover_mime: str,
+                       overwrite: bool) -> tuple[list[str], bool]:
+    import base64
+
+    import mutagen
+    from mutagen.flac import FLAC, Picture
+
+    audio = mutagen.File(str(path))
+    if audio is None:
+        raise ValueError("not a recognised Ogg/FLAC file")
+    if audio.tags is None:
+        audio.add_tags()
+    tags = audio.tags
+    mapping = (
+        ("TITLE", meta.title), ("ARTIST", meta.artist),
+        ("ALBUMARTIST", meta.album_artist or meta.artist), ("ALBUM", meta.album),
+        ("GENRE", meta.genre), ("DATE", meta.year),
+        ("TRACKNUMBER", str(meta.track_number) if meta.track_number else ""),
+    )
+    fields: list[str] = []
+    for key, value in mapping:
+        if not str(value).strip():
+            continue
+        if not _wants(tags.get(key), overwrite):
+            continue
+        tags[key] = [str(value)]
+        fields.append(key)
+    cover_written = False
+    if cover:
+        if isinstance(audio, FLAC):
+            if overwrite or not audio.pictures:
+                audio.clear_pictures()
+                picture = Picture()
+                picture.type = 3
+                picture.mime = cover_mime or "image/jpeg"
+                picture.desc = "Cover"
+                picture.data = cover
+                audio.add_picture(picture)
+                cover_written = True
+        else:
+            existing = tags.get("metadata_block_picture")
+            if overwrite or not existing:
+                picture = Picture()
+                picture.type = 3
+                picture.mime = cover_mime or "image/jpeg"
+                picture.desc = "Cover"
+                picture.data = cover
+                tags["metadata_block_picture"] = [
+                    base64.b64encode(picture.write()).decode("ascii")]
+                cover_written = True
+    if fields or cover_written:
+        audio.save()
+    return fields, cover_written
+
+
+def _write_mp4_tags(path: Path, meta: "TrackMetadata", cover: bytes, cover_mime: str,
+                    overwrite: bool) -> tuple[list[str], bool]:
+    from mutagen.mp4 import MP4, MP4Cover
+
+    audio = MP4(str(path))
+    if audio.tags is None:
+        audio.add_tags()
+    tags = audio.tags
+    mapping = (
+        ("\xa9nam", meta.title), ("\xa9ART", meta.artist),
+        ("aART", meta.album_artist or meta.artist), ("\xa9alb", meta.album),
+        ("\xa9gen", meta.genre), ("\xa9day", meta.year),
+    )
+    fields: list[str] = []
+    for atom, value in mapping:
+        if not str(value).strip():
+            continue
+        if not _wants(tags.get(atom), overwrite):
+            continue
+        tags[atom] = [str(value)]
+        fields.append(atom)
+    if meta.track_number:
+        if overwrite or not tags.get("trkn"):
+            tags["trkn"] = [(int(meta.track_number), 0)]
+            fields.append("trkn")
+    cover_written = False
+    if cover and (overwrite or not tags.get("covr")):
+        image_format = (MP4Cover.FORMAT_PNG if "png" in (cover_mime or "").lower()
+                        else MP4Cover.FORMAT_JPEG)
+        tags["covr"] = [MP4Cover(cover, imageformat=image_format)]
+        cover_written = True
+    if fields or cover_written:
+        audio.save()
+    return fields, cover_written
+
+
+def write_tags(path: Path, meta: "TrackMetadata", *, cover: bytes = b"",
+               cover_mime: str = "", mode: str = "fill_missing") -> TagWriteResult:
+    """Write canonical tags (and optionally a cover) into an audio file.
+
+    ``mode="fill_missing"`` keeps every value that already exists; ``"overwrite_all"``
+    replaces them. Cover art follows the same rule. Never raises.
+    """
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix not in TAG_EXTENSIONS:
+        return TagWriteResult(False, supported=False,
+                              message=f"tag writing is not supported for {suffix or 'this'} files")
+    overwrite = mode == "overwrite_all"
+    payload = cover or meta.cover
+    mime = cover_mime or meta.cover_mime
+    try:
+        if suffix in MP3_EXTENSIONS:
+            fields, cover_written = _write_mp3_tags(path, meta, payload, mime, overwrite)
+        elif suffix in VORBIS_EXTENSIONS:
+            fields, cover_written = _write_vorbis_tags(path, meta, payload, mime, overwrite)
+        else:
+            fields, cover_written = _write_mp4_tags(path, meta, payload, mime, overwrite)
+    except PermissionError:
+        return TagWriteResult(False, message="the file is read-only or locked by another program")
+    except Exception as exc:  # mutagen raises many unrelated types for damaged files
+        logger.debug("tag writing failed for %s", path.name, exc_info=True)
+        return TagWriteResult(False, message=f"{exc.__class__.__name__}: {exc}")
+    if not fields and not cover_written:
+        return TagWriteResult(True, message="nothing to change (all fields already present)")
+    return TagWriteResult(True, fields=fields, cover_written=cover_written)
+
+
+def save_lyrics(path: Path, lrc_text: str, *, output_mode: str = "lrc",
+                language: Optional[str] = None) -> SaveLyricsResult:
+    """The lyric editor's Save & Apply: refresh the ``.lrc`` and/or re-embed the tags.
+
+    The ``.lrc`` is also refreshed when one already exists, so an embed-only setup
+    never leaves a stale sidecar behind.
+    """
+    from .lrc_utils import validate_synced, write_text_atomic
+
+    path = Path(path)
+    lrc_path = path.with_suffix(".lrc")
+    ok, reason, _ = validate_synced(lrc_text, None, min_lines=1)
+    if not ok:
+        return SaveLyricsResult(False, message=f"the edited lyrics are not valid ({reason})")
+    wrote_lrc = False
+    embedded: Optional[EmbedResult] = None
+    try:
+        if output_mode in ("lrc", "both") or lrc_path.exists():
+            write_text_atomic(lrc_path, lrc_text)
+            wrote_lrc = True
+        if output_mode in ("embed", "both"):
+            embedded = embed_lyrics(path, lrc_text, language=language)
+    except OSError as exc:
+        return SaveLyricsResult(False, wrote_lrc=wrote_lrc, embedded=embedded,
+                                message=f"could not write the lyrics: {exc.strerror or exc}")
+    if not wrote_lrc and (embedded is None or not embedded.ok):
+        return SaveLyricsResult(False, embedded=embedded,
+                                message=embedded.message if embedded else "nothing was written")
+    return SaveLyricsResult(True, wrote_lrc=wrote_lrc, embedded=embedded)

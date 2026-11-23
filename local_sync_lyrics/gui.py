@@ -37,19 +37,28 @@ from PySide6.QtGui import (
     QColor, QFont, QGuiApplication, QIcon, QPixmap, QTextCharFormat, QTextCursor,
 )
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
-    QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog,
+    QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QScrollArea, QSizePolicy, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from . import __version__
+from .api_providers import test_custom_provider
 from .app_paths import asset_path, data_dir, database_path, logs_dir
 from .config import (
     ACCENT_PRESETS, CUSTOM_ACCENT_ID, OUTPUT_MODE_LABELS, OUTPUT_MODES, PROVIDER_IDS,
-    TIER1_IDS, TIER2_IDS, Settings, SettingsStore, find_accent_preset,
+    TAG_MODE_LABELS, TAG_MODES, TIER1_IDS, TIER2_IDS, CustomProvider, Settings,
+    SettingsStore, find_accent_preset,
 )
 from .database import LyricsDatabase, clear_cache_file
 from .hardware_profiler import HardwareProfile, get_profile, run_preflight
+from .language import detect_text_language
+from .lrc_utils import (
+    LrcLine, compose_lrc, format_timestamp, parse_timestamp, repair_lrc, split_lrc,
+)
+from .metadata import read_embedded_lyrics, save_lyrics
 from .models import Event
 from .processor import AUDIO_EXTENSIONS, BatchProcessor
 from .theme import (
@@ -434,6 +443,557 @@ class CustomLyricsDialog(QDialog):
 
 
 # --------------------------------------------------------------------------- window
+def _stamp_text(seconds: float) -> str:
+    """Editable timestamp cell text (``mm:ss.cc`` - no brackets)."""
+    return format_timestamp(seconds).strip("[]")
+
+
+class LyricEditorDialog(QDialog):
+    """Review / edit / re-time lyrics, then write them back (Phase 3).
+
+    The table and the raw ``.lrc`` view are two faces of the same document. Saving runs
+    on a thread-pool job, so a slow disk or tag rewrite never freezes the UI.
+    """
+
+    saved = Signal(object)   # SaveLyricsResult
+
+    def __init__(self, path: Path, text: str, palette: Palette, *,
+                 output_mode: str = "lrc",
+                 saver: Optional[Callable[[str], Any]] = None,
+                 parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("EditorDialog")
+        self.setWindowTitle(f"Lyric editor - {Path(path).name}")
+        self.resize(920, 660)
+        self.setMinimumSize(760, 520)
+        self.path = Path(path)
+        self.palette = palette
+        self.output_mode = output_mode
+        self._saver = saver or (lambda value: save_lyrics(self.path, value,
+                                                          output_mode=self.output_mode))
+        self._header, lines = split_lrc(text or "")
+        self._jobs: set[Job] = set()
+        self.pool = QThreadPool.globalInstance()
+        self.edited_text = ""
+        self._build()
+        self._load_lines(lines)
+        if not lines:
+            self._set_status("No timed lyrics yet - add a line and a timestamp.", ok=False)
+
+    # ------------------------------------------------------------------ build
+    def _build(self) -> None:
+        box = QVBoxLayout(self)
+        box.setContentsMargins(22, 20, 22, 18)
+        box.setSpacing(12)
+
+        header = QVBoxLayout()
+        header.setSpacing(2)
+        header.addWidget(_label("Lyric Editor", "Title"))
+        header.addWidget(_label(str(self.path), "Tiny", wrap=True, selectable=True))
+        box.addLayout(header)
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
+        self.insert_btn = _button("Insert Line", "Glass")
+        self.insert_btn.clicked.connect(self._insert_row)
+        self.delete_btn = _button("Delete Line", "Danger")
+        self.delete_btn.clicked.connect(self._delete_rows)
+        self.shift_spin = QSpinBox()
+        self.shift_spin.setRange(10, 10_000)
+        self.shift_spin.setSingleStep(50)
+        self.shift_spin.setValue(100)
+        self.shift_spin.setSuffix(" ms")
+        self.shift_spin.setFixedWidth(110)
+        self.shift_back = _button("Shift -", "Glass")
+        self.shift_back.clicked.connect(lambda: self._shift(-self.shift_spin.value()))
+        self.shift_fwd = _button("Shift +", "Glass")
+        self.shift_fwd.clicked.connect(lambda: self._shift(self.shift_spin.value()))
+        self.validate_btn = _button("Validate Timestamps", "Quiet")
+        self.validate_btn.clicked.connect(self._validate)
+        toolbar.addWidget(self.insert_btn)
+        toolbar.addWidget(self.delete_btn)
+        toolbar.addSpacing(8)
+        toolbar.addWidget(self.shift_back)
+        toolbar.addWidget(self.shift_spin)
+        toolbar.addWidget(self.shift_fwd)
+        toolbar.addWidget(self.validate_btn)
+        toolbar.addStretch(1)
+        box.addLayout(toolbar)
+
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Timestamp [mm:ss.xx]", "Lyric line"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed
+                                   | QAbstractItemView.AnyKeyPressed)
+        header_view = self.table.horizontalHeader()
+        header_view.setSectionResizeMode(0, QHeaderView.Fixed)
+        header_view.setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.setColumnWidth(0, 160)
+        self.table.itemChanged.connect(lambda *_: None)
+
+        self.raw_view = QPlainTextEdit()
+        self.raw_view.setObjectName("RawLrc")
+        self.raw_view.setPlaceholderText("[00:12.34]A lyric line")
+
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.table)
+        self.stack.addWidget(self.raw_view)
+        box.addWidget(self.stack, 1)
+
+        self.status = _label("", "Caption", wrap=True)
+        box.addWidget(self.status)
+
+        footer = QHBoxLayout()
+        footer.setSpacing(10)
+        self.raw_toggle = QCheckBox("Raw .lrc view")
+        self.raw_toggle.toggled.connect(self._toggle_raw)
+        self.cancel_btn = _button("Cancel", "Glass")
+        self.cancel_btn.clicked.connect(self.reject)
+        self.save_btn = _button("Save && Apply", "Primary")
+        self.save_btn.clicked.connect(self._save)
+        footer.addWidget(self.raw_toggle)
+        footer.addStretch(1)
+        footer.addWidget(self.cancel_btn)
+        footer.addWidget(self.save_btn)
+        box.addLayout(footer)
+
+    # ------------------------------------------------------------------- data
+    def _append_row(self, time: float, text: str, row: Optional[int] = None) -> None:
+        row = self.table.rowCount() if row is None else row
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(_stamp_text(time)))
+        self.table.setItem(row, 1, QTableWidgetItem(text))
+
+    def _load_lines(self, lines: list[LrcLine]) -> None:
+        self.table.blockSignals(True)
+        self.table.setRowCount(0)
+        for line in lines:
+            self._append_row(line.time, line.text)
+        self.table.blockSignals(False)
+
+    def _row_lines(self) -> tuple[list[LrcLine], list[str]]:
+        lines: list[LrcLine] = []
+        problems: list[str] = []
+        for row in range(self.table.rowCount()):
+            stamp_item = self.table.item(row, 0)
+            text_item = self.table.item(row, 1)
+            stamp = stamp_item.text().strip() if stamp_item else ""
+            text = text_item.text().strip() if text_item else ""
+            if not stamp and not text:
+                continue
+            seconds = parse_timestamp(stamp)
+            if seconds is None:
+                problems.append(f"Row {row + 1}: “{stamp}” is not a mm:ss.xx timestamp")
+                continue
+            lines.append(LrcLine(seconds, text))
+        lines.sort(key=lambda line: line.time)
+        return lines, problems
+
+    def _current_text(self) -> tuple[str, list[str]]:
+        if self.raw_toggle.isChecked():
+            fixed, problems = repair_lrc(self.raw_view.toPlainText())
+            header, lines = split_lrc(fixed)
+            return compose_lrc(header or self._header, lines), problems
+        lines, problems = self._row_lines()
+        return compose_lrc(self._header, lines), problems
+
+    # ----------------------------------------------------------------- actions
+    def _insert_row(self) -> None:
+        current = self.table.currentRow()
+        row = self.table.rowCount() if current < 0 else current + 1
+        lines, _ = self._row_lines()
+        last = max((line.time for line in lines), default=0.0)
+        if current >= 0:
+            base = parse_timestamp(self.table.item(current, 0).text()) or last
+            new_time = base + 2.0
+        else:
+            new_time = last + 2.0 if lines else 0.0
+        self._append_row(new_time, "", row)
+        self.table.setCurrentCell(row, 1)
+        self.table.editItem(self.table.item(row, 1))
+        self._set_status("Line inserted - type the words and a timestamp.", ok=True)
+
+    def _delete_rows(self) -> None:
+        rows = sorted({index.row() for index in self.table.selectedIndexes()}, reverse=True)
+        if not rows:
+            rows = [self.table.currentRow()] if self.table.currentRow() >= 0 else []
+        for row in rows:
+            if 0 <= row < self.table.rowCount():
+                self.table.removeRow(row)
+        self._set_status(f"Removed {len(rows)} line(s).", ok=True)
+
+    def _shift(self, delta_ms: int) -> None:
+        if self.raw_toggle.isChecked():
+            fixed, problems = repair_lrc(self.raw_view.toPlainText())
+            header, lines = split_lrc(fixed)
+            shifted = sorted(
+                (LrcLine(max(0.0, line.time + delta_ms / 1000.0), line.text) for line in lines),
+                key=lambda line: line.time)
+            self.raw_view.setPlainText(compose_lrc(header or self._header, shifted))
+            message = f"Shifted every timestamp by {delta_ms:+d} ms."
+            if problems:
+                message += f" {len(problems)} untimed line(s) were left alone."
+            self._set_status(message, ok=not problems)
+            return
+        problems = 0
+        self.table.blockSignals(True)
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is None:
+                continue
+            seconds = parse_timestamp(item.text())
+            if seconds is None:
+                problems += 1
+                continue
+            item.setText(_stamp_text(max(0.0, seconds + delta_ms / 1000.0)))
+        self.table.blockSignals(False)
+        message = f"Shifted every timestamp by {delta_ms:+d} ms."
+        if problems:
+            message += f" {problems} invalid timestamp(s) were left alone."
+        self._set_status(message, ok=not problems)
+
+    def _validate(self) -> None:
+        text, problems = self._current_text()
+        fixed, repair_problems = repair_lrc(text)
+        header, lines = split_lrc(fixed)
+        self._load_lines(lines)
+        if self.raw_toggle.isChecked():
+            self.raw_view.setPlainText(compose_lrc(header, lines))
+        if problems or repair_problems:
+            shown = "; ".join((problems + repair_problems)[:4])
+            self._set_status(f"Could not time {len(problems + repair_problems)} line(s): {shown}",
+                             ok=False)
+        else:
+            self._set_status(f"All {len(lines)} timestamps are valid and sorted.", ok=True)
+
+    def _toggle_raw(self, raw: bool) -> None:
+        self.insert_btn.setEnabled(not raw)
+        self.delete_btn.setEnabled(not raw)
+        if raw:
+            lines, problems = self._row_lines()          # read the table, not the empty view
+            self.raw_view.setPlainText(compose_lrc(self._header, lines))
+            self.stack.setCurrentWidget(self.raw_view)
+            if problems:
+                self._set_status("Fix the raw text before switching back.", ok=False)
+        else:
+            fixed, problems = repair_lrc(self.raw_view.toPlainText())
+            header, lines = split_lrc(fixed)
+            if header:
+                self._header = header
+            self._load_lines(lines)
+            self.stack.setCurrentWidget(self.table)
+            if problems:
+                self._set_status(f"{len(problems)} line(s) had no timestamp and were ignored.",
+                                 ok=False)
+            else:
+                self._set_status(f"Loaded {len(lines)} timed line(s).", ok=True)
+
+    # ------------------------------------------------------------------- save
+    def _set_busy(self, busy: bool) -> None:
+        for widget in (self.insert_btn, self.delete_btn, self.shift_back, self.shift_fwd,
+                       self.shift_spin, self.validate_btn, self.raw_toggle, self.cancel_btn,
+                       self.table, self.raw_view):
+            widget.setEnabled(not busy)
+        self.save_btn.setEnabled(not busy)
+        self.save_btn.setText("Saving…" if busy else "Save && Apply")
+
+    def _set_status(self, message: str, *, ok: bool = True) -> None:
+        self.status.setText(message)
+        self.status.setObjectName("SuccessText" if ok else "ErrorText")
+        _repolish(self.status)
+
+    def _save(self) -> None:
+        text, problems = self._current_text()
+        if problems:
+            self._set_status("Fix these first: " + "; ".join(problems[:4]), ok=False)
+            return
+        header, lines = split_lrc(text)
+        if not lines:
+            self._set_status("There are no timed lines to save.", ok=False)
+            return
+        if self.raw_toggle.isChecked() and header:
+            self._header = header
+        text = compose_lrc(self._header, lines)
+        self.edited_text = text
+        self._set_busy(True)
+        self._set_status("Writing the lyrics…", ok=True)
+
+        job = Job(lambda: self._saver(text))
+        job.signals.done.connect(self._on_saved)
+        job.signals.error.connect(self._on_save_error)
+        self._jobs.add(job)
+        self.pool.start(job)
+
+    @Slot(object)
+    def _on_saved(self, result: Any) -> None:
+        self._jobs.clear()
+        self._set_busy(False)
+        ok = bool(getattr(result, "ok", False))
+        if ok:
+            self.saved.emit(result)
+            self.accept()
+            return
+        message = getattr(result, "describe", lambda: str(result))()
+        self._set_status(f"Could not save: {message}", ok=False)
+
+    @Slot(str)
+    def _on_save_error(self, message: str) -> None:
+        self._jobs.clear()
+        self._set_busy(False)
+        self._set_status(f"Could not save: {message}", ok=False)
+
+
+class CustomProviderForm(QDialog):
+    """Add / edit one custom lyrics endpoint."""
+
+    def __init__(self, provider: Optional[CustomProvider], parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("ProviderDialog")
+        self.setWindowTitle("Custom lyrics provider")
+        self.setMinimumWidth(560)
+        self._original = provider or CustomProvider()
+        self._build()
+
+    def _build(self) -> None:
+        box = QVBoxLayout(self)
+        box.setContentsMargins(22, 20, 22, 18)
+        box.setSpacing(12)
+        box.addWidget(_label("Custom provider", "Title"))
+        box.addWidget(_label(
+            "Use {artist}, {title} and {album} in the URL. Values are URL-encoded automatically.",
+            "Caption", wrap=True))
+
+        form = QFormLayout()
+        form.setSpacing(10)
+        self.name_field = QLineEdit(self._original.name)
+        self.name_field.setPlaceholderText("My lyrics site")
+        self.url_field = QLineEdit(self._original.url_template)
+        self.url_field.setPlaceholderText("https://example.com/api/lyrics?artist={artist}&title={title}")
+        self.type_dd = QComboBox()
+        self.type_dd.addItem("LRC document (the response body is .lrc)", "lrc")
+        self.type_dd.addItem("JSON (extract the lyrics with a dot path)", "json")
+        index = self.type_dd.findData(self._original.response_type)
+        self.type_dd.setCurrentIndex(max(0, index))
+        self.path_field = QLineEdit(self._original.json_lyrics_path)
+        self.path_field.setPlaceholderText("data.lyrics")
+        self.enabled_check = QCheckBox("Enabled")
+        self.enabled_check.setChecked(self._original.enabled)
+        form.addRow("Name", self.name_field)
+        form.addRow("URL template", self.url_field)
+        form.addRow("Response", self.type_dd)
+        form.addRow("JSON lyrics path", self.path_field)
+        form.addRow("", self.enabled_check)
+        box.addLayout(form)
+
+        self.error = _label("", "ErrorText", wrap=True)
+        box.addWidget(self.error)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = _button("Cancel", "Glass")
+        cancel.clicked.connect(self.reject)
+        save = _button("Save", "Primary")
+        save.clicked.connect(self._accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(save)
+        box.addLayout(buttons)
+
+        self.type_dd.currentIndexChanged.connect(self._sync_type)
+        self._sync_type()
+
+    def _sync_type(self) -> None:
+        is_json = self.type_dd.currentData() == "json"
+        self.path_field.setEnabled(is_json)
+        if is_json and not self.path_field.text().strip():
+            self.path_field.setText("data.lyrics")
+
+    def _accept(self) -> None:
+        provider = CustomProvider(
+            name=self.name_field.text(),
+            enabled=self.enabled_check.isChecked(),
+            url_template=self.url_field.text(),
+            response_type=self.type_dd.currentData() or "lrc",
+            json_lyrics_path=self.path_field.text(),
+        ).normalised()
+        if not provider.name:
+            self.error.setText("Give the provider a name.")
+            return
+        if not provider.url_template.startswith(("http://", "https://")):
+            self.error.setText("The URL must start with http:// or https://.")
+            return
+        if "{title}" not in provider.url_template and "{artist}" not in provider.url_template:
+            self.error.setText("The URL needs a {title} or {artist} placeholder.")
+            return
+        if provider.response_type == "json" and not provider.json_lyrics_path:
+            self.error.setText("A JSON provider needs a dot path to the lyrics, e.g. data.lyrics.")
+            return
+        self.provider = provider
+        self.accept()
+
+
+class CustomProvidersDialog(QDialog):
+    """Manage the user's own lyrics endpoints (add / edit / toggle / test / delete)."""
+
+    def __init__(self, providers: list[CustomProvider], palette: Palette,
+                 parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("ProviderDialog")
+        self.setWindowTitle("Custom lyrics providers")
+        self.resize(860, 520)
+        self.setMinimumSize(700, 420)
+        self.palette = palette
+        self.providers = [p.normalised() for p in providers]
+        self._jobs: set[Job] = set()
+        self.pool = QThreadPool.globalInstance()
+        self._build()
+        self._refresh()
+
+    def _build(self) -> None:
+        box = QVBoxLayout(self)
+        box.setContentsMargins(22, 20, 22, 18)
+        box.setSpacing(12)
+        box.addWidget(_label("Custom lyrics providers", "Title"))
+        box.addWidget(_label(
+            "Queried after the built-in providers, in this order. A broken endpoint is "
+            "logged and skipped; it can never abort a batch.", "Caption", wrap=True))
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["On", "Name", "Type", "URL template"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        self.table.setColumnWidth(0, 46)
+        self.table.setColumnWidth(1, 180)
+        self.table.setColumnWidth(2, 90)
+        self.table.itemChanged.connect(self._on_item_changed)
+        self.table.itemDoubleClicked.connect(lambda *_: self._edit())
+        box.addWidget(self.table, 1)
+
+        self.status = _label("", "Caption", wrap=True)
+        box.addWidget(self.status)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        add = _button("Add…", "Primary")
+        add.clicked.connect(self._add)
+        edit = _button("Edit…", "Glass")
+        edit.clicked.connect(self._edit)
+        self.test_btn = _button("Test", "Glass")
+        self.test_btn.clicked.connect(self._test)
+        delete = _button("Delete", "Danger")
+        delete.clicked.connect(self._delete)
+        close = _button("Close", "Glass")
+        close.clicked.connect(self.accept)
+        buttons.addWidget(add)
+        buttons.addWidget(edit)
+        buttons.addWidget(self.test_btn)
+        buttons.addWidget(delete)
+        buttons.addStretch(1)
+        buttons.addWidget(close)
+        box.addLayout(buttons)
+
+    # ------------------------------------------------------------------ table
+    def _refresh(self) -> None:
+        self.table.blockSignals(True)
+        self.table.setRowCount(0)
+        for provider in self.providers:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            on = QTableWidgetItem("")
+            on.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
+            on.setCheckState(Qt.Checked if provider.enabled else Qt.Unchecked)
+            self.table.setItem(row, 0, on)
+            self.table.setItem(row, 1, QTableWidgetItem(provider.name))
+            self.table.setItem(row, 2, QTableWidgetItem(
+                "LRC" if provider.response_type == "lrc" else "JSON"))
+            self.table.setItem(row, 3, QTableWidgetItem(provider.url_template))
+        self.table.blockSignals(False)
+        enabled = sum(1 for provider in self.providers if provider.enabled)
+        self._set_status(f"{len(self.providers)} endpoint(s), {enabled} enabled.", ok=True)
+
+    def _on_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() != 0:
+            return
+        index = item.row()
+        if 0 <= index < len(self.providers):
+            self.providers[index].enabled = item.checkState() == Qt.Checked
+
+    def _selected(self) -> Optional[int]:
+        rows = sorted({index.row() for index in self.table.selectedIndexes()})
+        row = rows[0] if rows else self.table.currentRow()
+        return row if 0 <= row < len(self.providers) else None
+
+    def _set_status(self, message: str, *, ok: bool = True) -> None:
+        self.status.setText(message)
+        self.status.setObjectName("SuccessText" if ok else "ErrorText")
+        _repolish(self.status)
+
+    def _add(self) -> None:
+        form = CustomProviderForm(None, self)
+        if form.exec() == QDialog.Accepted:
+            self.providers.append(form.provider)
+            self._refresh()
+            self.table.selectRow(self.table.rowCount() - 1)
+            self._set_status(f"Added “{form.provider.name}”.", ok=True)
+
+    def _edit(self) -> None:
+        index = self._selected()
+        if index is None:
+            self._set_status("Select a provider first.", ok=False)
+            return
+        form = CustomProviderForm(self.providers[index], self)
+        if form.exec() == QDialog.Accepted:
+            self.providers[index] = form.provider
+            self._refresh()
+            self.table.selectRow(index)
+            self._set_status(f"Updated “{form.provider.name}”.", ok=True)
+
+    def _delete(self) -> None:
+        index = self._selected()
+        if index is None:
+            self._set_status("Select a provider first.", ok=False)
+            return
+        provider = self.providers.pop(index)
+        self._refresh()
+        self._set_status(f"Deleted “{provider.name}”.", ok=True)
+
+    def _test(self) -> None:
+        index = self._selected()
+        if index is None:
+            self._set_status("Select a provider first.", ok=False)
+            return
+        provider = self.providers[index]
+        self.test_btn.setEnabled(False)
+        self._set_status(f"Testing “{provider.name}” with Coldplay - Yellow…", ok=True)
+
+        job = Job(lambda: test_custom_provider(provider))
+        job.signals.done.connect(self._on_test_done)
+        job.signals.error.connect(self._on_test_error)
+        self._jobs.add(job)
+        self.pool.start(job)
+
+    @Slot(object)
+    def _on_test_done(self, result: Any) -> None:
+        self._jobs.clear()
+        self.test_btn.setEnabled(True)
+        self._set_status(str(result), ok=True)
+
+    @Slot(str)
+    def _on_test_error(self, message: str) -> None:
+        self._jobs.clear()
+        self.test_btn.setEnabled(True)
+        self._set_status(f"Test failed: {message}", ok=False)
+
+
 class MainWindow(QMainWindow):
     """The whole application window (sidebar + workspace + settings)."""
 
@@ -460,6 +1020,9 @@ class MainWindow(QMainWindow):
         self.isolation_ready: Optional[bool] = None
         self.log_entries: deque[tuple[str, str, str, str]] = deque(maxlen=MAX_LOG_LINES)
         self.custom_dialog: Optional[CustomLyricsDialog] = None
+        self.providers_dialog: Optional[CustomProvidersDialog] = None
+        self.editor_dialog: Optional[LyricEditorDialog] = None
+        self._last_saved: Optional[dict[str, str]] = None
 
         self.palette = build_palette(resolve_dark(self.settings.theme_mode, _system_is_dark()),
                                      self.settings.accent_color())
@@ -645,7 +1208,22 @@ class MainWindow(QMainWindow):
         isolate_row.addWidget(self.isolate_hint)
         isolate_row.addStretch(1)
 
-        library = self._card(_vbox(folder_row, output_row, isolate_row, spacing=12))
+        self.sw_autotag = QCheckBox("Auto-tag & cover art")
+        self.sw_autotag.toggled.connect(self._toggle_autotag)
+        self.tag_mode_dd = QComboBox()
+        for mode in TAG_MODES:
+            self.tag_mode_dd.addItem(TAG_MODE_LABELS[mode], mode)
+        self.tag_mode_dd.setFixedWidth(150)
+        self.tag_mode_dd.currentIndexChanged.connect(self._select_tag_mode)
+        self.tag_hint = _label("MusicBrainz + Cover Art Archive, iTunes fallback", "Tiny")
+        tag_row = QHBoxLayout()
+        tag_row.setSpacing(10)
+        tag_row.addWidget(self.sw_autotag)
+        tag_row.addWidget(self.tag_mode_dd)
+        tag_row.addWidget(self.tag_hint)
+        tag_row.addStretch(1)
+
+        library = self._card(_vbox(folder_row, output_row, isolate_row, tag_row, spacing=12))
         box.addWidget(library)
 
         # progress card --------------------------------------------------------
@@ -682,6 +1260,28 @@ class MainWindow(QMainWindow):
         progress_layout.addWidget(self.progress_bar)
         self.progress_card.setVisible(False)
         box.addWidget(self.progress_card)
+
+        # completion card (Phase 3) -------------------------------------------
+        self.completion_card = QFrame()
+        self.completion_card.setObjectName("CompletionCard")
+        completion_layout = QHBoxLayout(self.completion_card)
+        completion_layout.setContentsMargins(20, 14, 20, 14)
+        completion_layout.setSpacing(12)
+        completion_text = QVBoxLayout()
+        completion_text.setSpacing(2)
+        self.completion_title = _label("Lyrics ready", "Heading")
+        self.completion_detail = _label("", "Caption", wrap=True)
+        completion_text.addWidget(self.completion_title)
+        completion_text.addWidget(self.completion_detail)
+        self.edit_btn = _button("View / Edit Lyrics", "Primary")
+        self.edit_btn.clicked.connect(self._open_editor)
+        self.done_btn = _button("Done", "Glass")
+        self.done_btn.clicked.connect(self._dismiss_completion)
+        completion_layout.addLayout(completion_text, 1)
+        completion_layout.addWidget(self.edit_btn)
+        completion_layout.addWidget(self.done_btn)
+        self.completion_card.setVisible(False)
+        box.addWidget(self.completion_card)
 
         # stats ----------------------------------------------------------------
         stats = QHBoxLayout()
@@ -755,6 +1355,7 @@ class MainWindow(QMainWindow):
         column.addWidget(self._build_ai_card())
         column.addWidget(self._build_pipeline_card())
         column.addWidget(self._build_providers_card())
+        column.addWidget(self._build_tags_card())
         column.addWidget(self._build_batch_card())
         column.addWidget(self._build_about_card())
         column.addStretch(1)
@@ -866,11 +1467,40 @@ class MainWindow(QMainWindow):
         fields.addWidget(self.genius_field, 1)
         fields.addWidget(self.musixmatch_field, 1)
 
+        self.custom_providers_btn = _button("Custom providers…", "Glass")
+        self.custom_providers_btn.clicked.connect(self._open_providers)
+        self.custom_providers_summary = _label("No custom endpoints yet.", "Caption", wrap=True)
+        custom_row = QHBoxLayout()
+        custom_row.setSpacing(10)
+        custom_row.addWidget(self.custom_providers_summary, 1)
+        custom_row.addWidget(self.custom_providers_btn)
+
         body = _vbox(_label("Tier 1 - synced lyrics", "SectionLabel"), tier1,
                      _label("Tier 2 - plain text (aligned to the audio)", "SectionLabel"), tier2,
-                     fields, spacing=10)
+                     fields, _label("Your own endpoints", "SectionLabel"), custom_row, spacing=10)
         return self._card(body, title="Lyrics providers",
                           caption="Tier 1 is searched first, in this order.")
+
+    def _build_tags_card(self) -> QWidget:
+        self.sw_autotag_settings = QCheckBox("Complete tags and embed cover art")
+        self.sw_autotag_settings.toggled.connect(self._sync_autotag_controls)
+        self.tag_mode_settings = QComboBox()
+        for mode in TAG_MODES:
+            self.tag_mode_settings.addItem(TAG_MODE_LABELS[mode], mode)
+        self.tag_mode_settings.setFixedWidth(170)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        row.addWidget(self.sw_autotag_settings)
+        row.addWidget(self.tag_mode_settings)
+        row.addStretch(1)
+        body = _vbox(
+            row,
+            _label("Zero API keys: MusicBrainz + Cover Art Archive first, iTunes as a "
+                   "fallback. Writes title, artist, album, album artist, genre, year, "
+                   "track number and a high-resolution cover.", "Caption", wrap=True),
+            spacing=10)
+        return self._card(body, title="Tags & artwork",
+                          caption="Runs after lyrics are resolved, inside the same background job.")
 
     def _build_batch_card(self) -> QWidget:
         self.sw_recursive = QCheckBox("Include sub-folders")
@@ -1159,6 +1789,14 @@ class MainWindow(QMainWindow):
                 self.lang_chip.setVisible(False)
         elif event.kind == "confirm":
             self._show_confirm(event.data or {})
+        elif event.kind == "saved":
+            self._show_completion(event.data or {})
+        elif event.kind == "tagged":
+            data = event.data or {}
+            fields = ", ".join(data.get("fields") or [])
+            extra = " + cover art" if data.get("cover") else ""
+            self._append_log("OK", f"Tags written for {event.message} via "
+                                   f"{data.get('source', 'lookup')}: {fields}{extra}.")
 
     @Slot(object)
     def _on_event(self, event: Event) -> None:
@@ -1188,6 +1826,9 @@ class MainWindow(QMainWindow):
         self.clear_cache_btn.setEnabled(not running)
         self.custom_btn.setEnabled(not running)
         self.sw_isolate.setEnabled(not running)
+        self.sw_autotag.setEnabled(not running)
+        self.tag_mode_dd.setEnabled(not running and self.sw_autotag.isChecked())
+        self.custom_providers_btn.setEnabled(not running)
         self._refresh_output()
         if running:
             self._status = "running"
@@ -1253,6 +1894,95 @@ class MainWindow(QMainWindow):
             self._snack('Vocal isolation needs "audio-separator" '
                         '(pip install "audio-separator[cpu]"). Until it is installed the '
                         "original audio is used.")
+
+    def _toggle_autotag(self, checked: bool) -> None:
+        self.settings.auto_tag = bool(checked)
+        self.sw_autotag_settings.blockSignals(True)
+        self.sw_autotag_settings.setChecked(bool(checked))
+        self.sw_autotag_settings.blockSignals(False)
+        self._sync_autotag_controls()
+        self._save_bg(self.settings.copy())
+
+    def _select_tag_mode(self, _index: int = 0) -> None:
+        mode = self.tag_mode_dd.currentData() or "fill_missing"
+        self.settings.tag_mode = mode
+        index = self.tag_mode_settings.findData(mode)
+        if index >= 0 and index != self.tag_mode_settings.currentIndex():
+            self.tag_mode_settings.blockSignals(True)
+            self.tag_mode_settings.setCurrentIndex(index)
+            self.tag_mode_settings.blockSignals(False)
+        self._save_bg(self.settings.copy())
+
+    def _sync_autotag_controls(self) -> None:
+        """Keep the workspace switch and the Settings switch in step."""
+        enabled = self.sw_autotag_settings.isChecked()
+        if self.sw_autotag.isChecked() != enabled:
+            self.sw_autotag.blockSignals(True)
+            self.sw_autotag.setChecked(enabled)
+            self.sw_autotag.blockSignals(False)
+        self.tag_mode_dd.setEnabled(enabled)
+        self.tag_mode_settings.setEnabled(enabled)
+
+    def _refresh_provider_summary(self) -> None:
+        providers = self.settings.custom_providers
+        enabled = sum(1 for provider in providers if provider.enabled)
+        if not providers:
+            self.custom_providers_summary.setText("No custom endpoints yet.")
+        else:
+            self.custom_providers_summary.setText(
+                f"{len(providers)} custom endpoint(s), {enabled} enabled.")
+
+    def _open_providers(self) -> None:
+        dialog = CustomProvidersDialog(self.settings.custom_providers, self.palette, self)
+        self.providers_dialog = dialog
+        if dialog.exec() == QDialog.Accepted:
+            self.settings.custom_providers = [p.normalised() for p in dialog.providers
+                                              if p.valid()]
+            self.settings._normalise()
+            self._refresh_provider_summary()
+            self._save_bg(self.settings.copy(), toast=True)
+
+    # ------------------------------------------------------------------- editor
+    def _show_completion(self, data: dict) -> None:
+        self._last_saved = {
+            "path": str(data.get("path", "")),
+            "lrc": str(data.get("lrc", "")),
+            "source": str(data.get("source", "")),
+        }
+        name = Path(self._last_saved["path"]).name or "your track"
+        self.completion_title.setText("Lyrics ready to review")
+        self.completion_detail.setText(
+            f"{name} - {self._last_saved['source'] or 'synced'}. "
+            "Open the editor to fine-tune timestamps or wording.")
+        self.completion_card.setVisible(True)
+
+    def _dismiss_completion(self) -> None:
+        self.completion_card.setVisible(False)
+
+    def _open_editor(self) -> None:
+        if not self._last_saved or not self._last_saved.get("path"):
+            self._snack("Sync a track first, then edit its lyrics here.")
+            return
+        path = Path(self._last_saved["path"])
+        text = self._last_saved.get("lrc") or ""
+        if path.exists():
+            lrc_path = path.with_suffix(".lrc")
+            if lrc_path.exists():
+                try:
+                    text = lrc_path.read_text(encoding="utf-8")
+                except OSError:
+                    pass
+        dialog = LyricEditorDialog(path, text, self.palette,
+                                   output_mode=self.settings.output_mode, parent=self)
+        dialog.saved.connect(self._on_lyrics_saved)
+        self.editor_dialog = dialog
+        dialog.exec()
+
+    def _on_lyrics_saved(self, result: Any) -> None:
+        self._snack(f"Lyrics saved: {result.describe()}")
+        if self._last_saved is not None:
+            self._last_saved["lrc"] = self.editor_dialog.edited_text if self.editor_dialog else ""
+
 
     def _refresh_custom_options(self) -> None:
         if self.custom_dialog is not None and self.custom_dialog.isVisible():
@@ -1320,6 +2050,9 @@ class MainWindow(QMainWindow):
         s.genius_token = self.genius_field.text().strip()
         s.musixmatch_key = self.musixmatch_field.text().strip()
         s.enabled_providers = [pid for pid, cb in self.provider_checks.items() if cb.isChecked()]
+        s.auto_tag = self.sw_autotag_settings.isChecked()
+        s.tag_mode = self.tag_mode_settings.currentData() or "fill_missing"
+        s.custom_providers = [p.normalised() for p in self.settings.custom_providers]
         s.last_folder = self.folder_field.text().strip()
         s._normalise()
         return s
@@ -1350,6 +2083,18 @@ class MainWindow(QMainWindow):
         self.sw_isolate.blockSignals(False)
         for pid, cb in self.provider_checks.items():
             cb.setChecked(pid in s.enabled_providers)
+        self.sw_autotag_settings.blockSignals(True)
+        self.sw_autotag_settings.setChecked(s.auto_tag)
+        self.sw_autotag_settings.blockSignals(False)
+        self.sw_autotag.blockSignals(True)
+        self.sw_autotag.setChecked(s.auto_tag)
+        self.sw_autotag.blockSignals(False)
+        index = self.tag_mode_settings.findData(s.tag_mode)
+        self.tag_mode_settings.setCurrentIndex(max(0, index))
+        index = self.tag_mode_dd.findData(s.tag_mode)
+        self.tag_mode_dd.setCurrentIndex(max(0, index))
+        self._sync_autotag_controls()
+        self._refresh_provider_summary()
         self._refresh_output()
 
     def _save_settings(self) -> None:
@@ -1415,6 +2160,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_label.setText("Starting…")
         self.current_file.setText("")
+        self.completion_card.setVisible(False)
+        self._last_saved = None
         for label in self.stat_values.values():
             label.setText("0")
         self._set_running(True)
@@ -1472,6 +2219,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_label.setText("Starting…")
         self.current_file.setText(audio.name)
+        self.completion_card.setVisible(False)
+        self._last_saved = None
         for label in self.stat_values.values():
             label.setText("0")
         self._set_running(True)

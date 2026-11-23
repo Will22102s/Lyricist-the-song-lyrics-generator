@@ -145,6 +145,36 @@ class TranscriptionResult:
 
 
 @dataclass
+class TrackMetadata:
+    """Canonical tags returned by the online metadata lookup (Phase 3)."""
+
+    title: str = ""
+    artist: str = ""
+    album: str = ""
+    album_artist: str = ""
+    genre: str = ""
+    year: str = ""
+    track_number: int = 0
+    cover_art_url: str = ""
+    cover: bytes = b""
+    cover_mime: str = ""
+    source: str = ""
+    score: float = 0.0
+
+    def fields(self) -> dict[str, str]:
+        """Non-empty text fields, in a stable order (used for logging/tests)."""
+        pairs = (
+            ("title", self.title), ("artist", self.artist), ("album", self.album),
+            ("album_artist", self.album_artist), ("genre", self.genre),
+            ("year", self.year), ("track_number", str(self.track_number) if self.track_number else ""),
+        )
+        return {name: value for name, value in pairs if str(value).strip()}
+
+    def is_empty(self) -> bool:
+        return not self.fields() and not self.cover
+
+
+@dataclass
 class Event:
     """Message from the worker thread to the UI / CLI.
 

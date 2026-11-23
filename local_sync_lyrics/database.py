@@ -201,6 +201,19 @@ class LyricsDatabase:
             except sqlite3.Error as exc:
                 logger.warning("cache write failed: %s", exc)
 
+    def rekey(self, old: str, new: str) -> None:
+        """Keep the cache entry valid after tag writing changed the file's fingerprint."""
+        if not old or not new or old == new:
+            return
+        with self._lock:
+            if self._conn is None:
+                return
+            try:
+                self._conn.execute(
+                    "UPDATE OR REPLACE tracks SET fingerprint=? WHERE fingerprint=?", (new, old))
+            except sqlite3.Error as exc:
+                logger.warning("cache rekey failed: %s", exc)
+
     def stats(self) -> dict[str, int]:
         with self._lock:
             if self._conn is None:

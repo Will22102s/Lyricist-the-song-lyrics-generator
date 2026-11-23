@@ -111,6 +111,79 @@ def format_timestamp(seconds: float) -> str:
     return f"[{minutes:02d}:{secs:02d}.{cs:02d}]"
 
 
+# ---------------------------------------------------- editing (Phase 3 editor)
+_TIMESTAMP_CELL_RE = re.compile(
+    r"^\s*\[?\s*(\d{1,3})\s*:\s*(\d{1,2})(?:\s*[.:,]\s*(\d{1,3}))?\s*\]?\s*$")
+_LOOSE_LINE_RE = re.compile(
+    r"^\s*\[?\s*(\d{1,3})\s*:\s*(\d{1,2})(?:\s*[.:,]\s*(\d{1,3}))?\s*\]?\s*(.*)$")
+_HEADER_LINE_RE = re.compile(r"^\s*\[(ti|ar|al|by|re|ve|length|offset|tool):.*\]\s*$", re.IGNORECASE)
+
+
+def parse_timestamp(text: str) -> Optional[float]:
+    """Parse one editable timestamp cell into seconds.
+
+    Accepts ``01:02.34``, ``[01:02.34]``, ``1:2``, ``01:02,5`` and ``01:02:345``.
+    Returns ``None`` for anything that is not a minute:second stamp.
+    """
+    match = _TIMESTAMP_CELL_RE.match(str(text or ""))
+    if not match:
+        return None
+    return _to_seconds(match.group(1), match.group(2), match.group(3))
+
+
+def split_lrc(text: str) -> tuple[list[str], list[LrcLine]]:
+    """``(header_lines, timed_lines)`` - the header is preserved verbatim by the editor."""
+    header: list[str] = []
+    for raw in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        stripped = raw.strip().lstrip("\ufeff")
+        if stripped and _HEADER_LINE_RE.match(stripped):
+            if not _OFFSET_RE.match(stripped):     # times are already offset-adjusted
+                header.append(stripped)
+    return header, parse_lrc(text or "")
+
+
+def compose_lrc(header: list[str], lines: list[LrcLine]) -> str:
+    """Rebuild an LRC document from header lines and (already sorted) timed lines."""
+    head = [line.strip() for line in header if line.strip() and not _OFFSET_RE.match(line.strip())]
+    body = [f"{format_timestamp(line.time)}{line.text.strip()}" for line in lines]
+    return "\n".join(head + body) + "\n"
+
+
+def shift_lrc(text: str, delta_ms: int) -> str:
+    """Move every timestamp by *delta_ms* (negative = earlier); never below zero."""
+    header, lines = split_lrc(text)
+    shifted = [LrcLine(max(0.0, line.time + delta_ms / 1000.0), line.text) for line in lines]
+    return compose_lrc(header, sorted(shifted, key=lambda line: line.time))
+
+
+def repair_lrc(text: str) -> tuple[str, list[str]]:
+    """Normalise malformed timestamps (``[1:2:5]``, ``[01:02,5]``, missing brackets).
+
+    Returns ``(fixed_lrc, problems)`` where *problems* lists lines that could not be
+    timed. Header lines are kept; untimed text is reported rather than invented.
+    """
+    header: list[str] = []
+    lines: list[LrcLine] = []
+    problems: list[str] = []
+    for raw in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        stripped = raw.strip().lstrip("\ufeff")
+        if not stripped:
+            continue
+        if _HEADER_LINE_RE.match(stripped):
+            if not _OFFSET_RE.match(stripped):
+                header.append(stripped)
+            continue
+        match = _LOOSE_LINE_RE.match(stripped)
+        if not match:
+            problems.append(stripped)
+            continue
+        stamp = _to_seconds(match.group(1), match.group(2), match.group(3))
+        body = _WORD_TS_RE.sub("", match.group(4) or "").strip()
+        lines.append(LrcLine(max(0.0, stamp), body))
+    lines.sort(key=lambda line: line.time)
+    return compose_lrc(header, lines), problems
+
+
 def _clean_tag(value: str) -> str:
     return " ".join(str(value).replace("\r", " ").replace("\n", " ").split())
 

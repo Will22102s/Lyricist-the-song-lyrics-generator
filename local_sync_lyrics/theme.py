@@ -356,6 +356,11 @@ QFrame#Banner {{
     border: 1px solid {qss_color(with_alpha(p.warn, 0.55))};
     border-radius: 14px;
 }}
+QFrame#CompletionCard {{
+    background-color: {accent_soft};
+    border: 1px solid {qss_color(with_alpha(p.accent, 0.45))};
+    border-radius: 20px;
+}}
 QFrame#Toast {{
     background-color: {surface};
     border: 1px solid {border_hi};
@@ -565,7 +570,7 @@ QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QSpinBox {{
 QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QComboBox:focus, QSpinBox:focus {{
     border: 1px solid {accent};
 }}
-QLineEdit:disabled, QPlainTextEdit:disabled, QComboBox:disabled {{
+QLineEdit:disabled, QPlainTextEdit:disabled, QTextEdit:disabled, QComboBox:disabled, QSpinBox:disabled {{
     color: {text3};
 }}
 QLineEdit[error="true"] {{
@@ -577,6 +582,56 @@ QPlainTextEdit#Log {{
     border-radius: 13px;
     padding: 8px;
     font-family: "SF Mono", "Cascadia Code", "Consolas", "DejaVu Sans Mono", monospace;
+    font-size: 12px;
+}}
+QPlainTextEdit#RawLrc {{
+    background-color: {log_bg};
+    border: 1px solid {field_border};
+    border-radius: 13px;
+    padding: 10px;
+    font-family: "SF Mono", "Cascadia Code", "Consolas", "DejaVu Sans Mono", monospace;
+    font-size: 12.5px;
+}}
+QTableWidget {{
+    background-color: {field};
+    alternate-background-color: {qss_color(with_alpha(p.text, 0.03))};
+    color: {text};
+    border: 1px solid {field_border};
+    border-radius: 12px;
+    gridline-color: {border};
+    selection-background-color: {accent_soft};
+    selection-color: {text};
+}}
+QTableWidget::item {{
+    padding: 6px 8px;
+    border: none;
+}}
+QTableWidget::item:selected {{
+    background-color: {accent_soft};
+    color: {text};
+}}
+QHeaderView::section {{
+    background-color: {glass_strong};
+    color: {text2};
+    border: none;
+    border-bottom: 1px solid {border};
+    padding: 8px 10px;
+    font-size: 12px;
+    font-weight: 600;
+}}
+QTableCornerButton::section {{
+    background-color: {glass_strong};
+    border: none;
+}}
+QDialog#EditorDialog, QDialog#ProviderDialog {{
+    background-color: {surface};
+}}
+QLabel#ErrorText {{
+    color: {err};
+    font-size: 12px;
+}}
+QLabel#SuccessText {{
+    color: {ok};
     font-size: 12px;
 }}
 QComboBox::drop-down {{

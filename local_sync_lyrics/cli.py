@@ -22,14 +22,16 @@ from rich.progress import (
 )
 
 from .app_paths import database_path
-from .config import OUTPUT_MODE_LABELS, OUTPUT_MODES, PROVIDER_IDS, SettingsStore
+from .config import (
+    OUTPUT_MODE_LABELS, OUTPUT_MODES, PROVIDER_IDS, TAG_MODE_LABELS, TAG_MODES, SettingsStore,
+)
 from .database import LyricsDatabase
 from .models import Event
 from .processor import BatchProcessor
 
 _COLORS = {"API": "cyan", "AI": "magenta", "OK": "green", "WARN": "yellow",
            "ERR": "red", "SKIP": "bright_black", "SYS": "blue", "INFO": "white",
-           "Audio": "bright_cyan", "Output": "bright_blue"}
+           "Audio": "bright_cyan", "Output": "bright_blue", "Tags": "bright_green"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,6 +49,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="where results go: " + "; ".join(f"{k} = {v}" for k, v in OUTPUT_MODE_LABELS.items()))
     p.add_argument("--isolate-vocals", action="store_true",
                    help="strip background music before transcribing (slow; needs audio-separator)")
+    p.add_argument("--auto-tag", action="store_true",
+                   help="complete missing tags and embed high-res cover art (MusicBrainz/iTunes)")
+    p.add_argument("--tag-mode", choices=TAG_MODES,
+                   help="auto-tag: " + "; ".join(f"{k} = {v}" for k, v in TAG_MODE_LABELS.items()))
     p.add_argument("--no-detect-language", action="store_true",
                    help="do not lock Whisper to a language detected on a 30 s sample")
     p.add_argument("--lyrics", metavar="FILE",
@@ -93,6 +99,10 @@ def run_cli(argv: list[str]) -> int:
         settings.output_mode = args.output
     if args.isolate_vocals:
         settings.isolate_vocals = True
+    if args.auto_tag:
+        settings.auto_tag = True
+    if args.tag_mode:
+        settings.tag_mode = args.tag_mode
     if args.no_detect_language:
         settings.detect_language = False
     settings._normalise()
