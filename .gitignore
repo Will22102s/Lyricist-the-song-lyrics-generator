@@ -1,0 +1,28 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# PyInstaller / build output
+build/
+dist/
+*.spec
+*.manifest
+
+# Local app data (settings, cache, models) if someone points LYRICIST_HOME here
+settings.json
+*.log
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

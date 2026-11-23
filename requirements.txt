@@ -1,0 +1,32 @@
+# Core runtime - lean, CPU-first, no CUDA wheels.
+#
+# Vocal isolation is OPTIONAL: install requirements-cpu.txt (or requirements-gpu.txt)
+# only if you want the "Isolate Vocals" switch.  Keeping torch / audio-separator out
+# of this file means a normal install is a few hundred MB instead of ~4-5 GB.
+#
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt                 # GUI + online lyrics + Whisper
+#   pip install -r requirements-cpu.txt             # + CPU vocal isolation (recommended)
+#   pip install -r requirements-gpu.txt             # + CUDA vocal isolation
+
+# --- GUI (native Qt 6 - no Flutter/Flet runtime, no WebEngine) ----------------
+# Essentials = QtCore/QtGui/QtWidgets; the Addons/WebEngine payload is not needed.
+PySide6-Essentials>=6.6,<7
+
+# --- Local AI fallback --------------------------------------------------------
+faster-whisper>=1.1.0,<2
+av>=12.3.0
+numpy>=1.26
+
+# --- Lyrics search ------------------------------------------------------------
+requests>=2.31
+beautifulsoup4>=4.12
+thefuzz>=0.22.0        # pulls in rapidfuzz (fast C implementation)
+
+# --- Metadata / system / console ---------------------------------------------
+mutagen>=1.47.0
+psutil>=5.9
+rich>=13.0.0
+
+# --- Lyrics language detection ------------------------------------------------
+langdetect>=1.0.9      # a built-in fallback exists if this is missing

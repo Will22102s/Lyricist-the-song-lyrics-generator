@@ -1,0 +1,19 @@
+# CPU-only vocal isolation (ONNX / PyTorch CPU wheels).
+#
+#   pip install -r requirements-cpu.txt
+#
+# The extra index makes pip prefer PyTorch's CPU wheels.  It is much smaller than
+# the default CUDA build (no cuDNN / Triton / NCCL payloads).
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+-r requirements.txt
+
+torch>=2.2
+onnxruntime>=1.17
+audio-separator>=0.30.0
+
+# Decoders used by audio-separator and by the stem loader.  FFmpeg itself must be
+# on PATH; audioread is the pure-Python fallback.
+audioread>=3.0.1
+librosa>=0.10.0
+soundfile>=0.12.1

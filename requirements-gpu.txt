@@ -1,0 +1,17 @@
+# NVIDIA/CUDA vocal isolation (largest install: CUDA runtime + cuDNN + PyTorch).
+#
+#   pip install -r requirements-gpu.txt
+#
+# Use this only on a machine with a working NVIDIA driver and CUDA 12 runtime.
+# For CPU-only machines use requirements-cpu.txt instead.
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+-r requirements.txt
+
+torch>=2.2
+onnxruntime-gpu>=1.17
+audio-separator[gpu]>=0.30.0
+
+audioread>=3.0.1
+librosa>=0.10.0
+soundfile>=0.12.1
