@@ -57,7 +57,8 @@ from .lrc_utils import (
     MatchReport, match_lyrics, plain_to_lines, strip_to_plain, validate_synced, write_text_atomic,
 )
 from .metadata import (
-    EmbedResult, embed_lyrics, has_embedded_lyrics, read_track_info, write_tags,
+    EmbedResult, embed_lyrics, has_embedded_lyrics, make_thumbnail, read_artwork,
+    read_extra_tags, read_track_info, write_tags,
 )
 from .models import (
     BatchSummary, Event, ReferenceComponent, ReferenceScript, Status, TrackInfo,
@@ -97,6 +98,34 @@ CUSTOM_SNIPPET_SEC = 25.0
 Ask = Callable[[dict], bool]   # blocking "may I continue?" question to the user (worker thread)
 
 
+def discover_audio(root: Path, recursive: bool = True,
+                   on_error: Optional[Callable[[OSError], None]] = None) -> list[Path]:
+    """Audio files under *root* (or *root* itself when it is a single file).
+
+    Shared by the GUI queue (run in a background job) and :meth:`BatchProcessor.discover`.
+    """
+    root = Path(root)
+    if root.is_file():
+        return [root] if root.suffix.lower() in AUDIO_EXTENSIONS else []
+    files: list[Path] = []
+    if recursive:
+        for dirpath, dirnames, filenames in os.walk(root, onerror=on_error):
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+            for name in sorted(filenames):
+                if not name.startswith(".") and Path(name).suffix.lower() in AUDIO_EXTENSIONS:
+                    files.append(Path(dirpath) / name)
+    else:
+        try:
+            for entry in sorted(root.iterdir()):
+                if entry.is_file() and not entry.name.startswith(".") \
+                        and entry.suffix.lower() in AUDIO_EXTENSIONS:
+                    files.append(entry)
+        except OSError as exc:
+            if on_error is not None:
+                on_error(exc)
+    return files
+
+
 class BatchProcessor:
     def __init__(
         self,
@@ -119,6 +148,8 @@ class BatchProcessor:
         self._metadata_client: Optional[MetadataClient] = None
         self.summary = BatchSummary()
         self._ai_down: Optional[str] = None   # set once the Whisper model is unusable
+        self._language_code = ""
+        self._language_name = ""
 
     # ------------------------------------------------------ AI availability
     def _ai_enabled(self) -> bool:
@@ -165,6 +196,8 @@ class BatchProcessor:
 
     def _on_language(self, guess: LanguageGuess) -> None:
         """Tell the UI which language Whisper is now locked to (``data={}`` clears the badge)."""
+        self._language_code = guess.code or ""
+        self._language_name = guess.name or guess.code or ""
         try:
             self.emit(Event("language", message=guess.describe(), data={
                 "code": guess.code, "name": guess.name, "probability": guess.probability,
@@ -173,33 +206,28 @@ class BatchProcessor:
             logger.exception("emit failed")
 
     def _clear_language(self) -> None:
+        self._language_code = ""
+        self._language_name = ""
         try:
             self.emit(Event("language", message="", data={}))
         except Exception:
             logger.exception("emit failed")
 
+    def _track_event(self, kind: str, path: Path, status: str = "") -> None:
+        """Queue feedback for the GUI (``track_start`` / ``track_done``)."""
+        try:
+            self.emit(Event(kind, message=path.name, data={
+                "path": str(path), "status": status,
+                "language": self._language_code, "language_name": self._language_name}))
+        except Exception:
+            logger.exception("emit failed")
+
     # -------------------------------------------------------------- discovery
     def discover(self, root: Path) -> list[Path]:
-        files: list[Path] = []
-
         def onerror(err: OSError) -> None:
             self.log("WARN", f"Cannot read folder {err.filename}: {err.strerror}", "warning")
 
-        if self.settings.recursive:
-            for dirpath, dirnames, filenames in os.walk(root, onerror=onerror):
-                dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
-                for name in sorted(filenames):
-                    if not name.startswith(".") and Path(name).suffix.lower() in AUDIO_EXTENSIONS:
-                        files.append(Path(dirpath) / name)
-        else:
-            try:
-                for entry in sorted(root.iterdir()):
-                    if entry.is_file() and not entry.name.startswith(".") \
-                            and entry.suffix.lower() in AUDIO_EXTENSIONS:
-                        files.append(entry)
-            except OSError as exc:
-                onerror(exc)
-        return files
+        return discover_audio(root, self.settings.recursive, onerror)
 
     def _prepare_isolation(self) -> None:
         """Disable vocal isolation gracefully when its optional stack is incomplete.
@@ -226,12 +254,17 @@ class BatchProcessor:
         self.settings.isolate_vocals = False
 
     # --------------------------------------------------------------- main loop
-    def run(self, root: Path) -> BatchSummary:
+    def run(self, root: Path | list[Path] | tuple[Path, ...]) -> BatchSummary:
         started = time.monotonic()
         try:
             self._prepare_isolation()
-            self.log("SYS", f"Scanning {root} …")
-            files = self.discover(root)
+            if isinstance(root, (list, tuple, set)):
+                files = [Path(p) for p in root
+                         if Path(p).is_file() and Path(p).suffix.lower() in AUDIO_EXTENSIONS]
+                self.log("SYS", f"Processing {len(files)} selected track(s) …")
+            else:
+                self.log("SYS", f"Scanning {root} …")
+                files = self.discover(Path(root))
             self.summary.total = len(files)
             if not files:
                 self.log("WARN", "No audio files found in that folder.", "warning")
@@ -245,10 +278,13 @@ class BatchProcessor:
                     break
                 self.log("INFO", f"[{index}/{len(files)}] {path.name}")
                 self._clear_language()
+                self._track_event("track_start", path,
+                                  "isolating" if self.settings.isolate_vocals else "syncing")
                 self._progress(index - 1, len(files), path.name)
                 try:
                     status = self.process_track(path)
                 except OperationCancelled:
+                    self._track_event("track_done", path, Status.SKIPPED.value)
                     break
                 except Exception as exc:  # strict per-file boundary
                     logger.exception("Unhandled error on %s", path)
@@ -256,6 +292,7 @@ class BatchProcessor:
                     status = Status.FAILED
                     self._record_failure(path, str(exc))
                 self.summary.bump(status)
+                self._track_event("track_done", path, status.value)
                 self._progress(index, len(files), path.name)
         finally:
             self.summary.cancelled = self.cancel.is_set()
@@ -317,12 +354,46 @@ class BatchProcessor:
         return None
 
     def _record(self, fingerprint: str, track: TrackInfo, status: Status, *, source: str = "",
-                lrc_path: Optional[Path] = None, ai_tried: bool = False, error: str = "") -> None:
+                lrc_path: Optional[Path] = None, ai_tried: bool = False, error: str = "",
+                language: str = "") -> None:
+        extra: dict[str, str] = {}
+        thumbnail, thumbnail_mime = b"", ""
+        if status.value in ("synced_online", "synced_aligned", "synced_ai"):
+            try:
+                extra = read_extra_tags(track.path)
+            except Exception:
+                logger.debug("extra tags unavailable for %s", track.path, exc_info=True)
+            try:
+                raw, mime = read_artwork(track.path)
+                if raw:
+                    thumbnail, thumbnail_mime = make_thumbnail(raw, mime)
+            except Exception:
+                logger.debug("artwork unavailable for %s", track.path, exc_info=True)
         self.db.upsert(TrackRecord(
             fingerprint=fingerprint, path=str(track.path), status=status.value,
             artist=track.artist, title=track.title, duration=track.duration, source=source,
             lrc_path=str(lrc_path) if lrc_path else "", ai_tried=ai_tried, error=error,
+            album=track.album or extra.get("album", ""),
+            genre=extra.get("genre", ""), year=extra.get("year", ""),
+            language=language or extra.get("language", ""),
+            output_mode=self.settings.output_mode, provider_used=source,
+            synced_at=time.time() if status.value in (
+                "synced_online", "synced_aligned", "synced_ai") else 0.0,
+            thumbnail=thumbnail, thumbnail_mime=thumbnail_mime,
         ))
+
+    def _cache_artwork(self, path: Path) -> None:
+        """Refresh the stored thumbnail after the auto-tagger embedded new cover art."""
+        if self.db is None:
+            return
+        try:
+            raw, mime = read_artwork(path)
+            if not raw:
+                return
+            thumbnail, thumbnail_mime = make_thumbnail(raw, mime)
+            self.db.set_thumbnail(fingerprint_file(path), thumbnail, thumbnail_mime)
+        except Exception:
+            logger.debug("thumbnail refresh failed for %s", path, exc_info=True)
 
     def _record_failure(self, path: Path, error: str) -> None:
         try:
@@ -395,6 +466,7 @@ class BatchProcessor:
             return False
         if self.cancel.is_set():
             return False
+        before = fingerprint_file(path)
         try:
             result = write_tags(path, meta, mode=self.settings.tag_mode)
         except Exception as exc:  # write_tags already guards; belt and braces
@@ -405,6 +477,9 @@ class BatchProcessor:
             self.log(TAG_TAGS, f"Could not write tags to {path.name}: {result.message}", "warning")
             return False
         if result.fields or result.cover_written:
+            after = fingerprint_file(path)
+            if after != before and self.db is not None:
+                self.db.rekey(before, after)
             mode = "overwritten" if self.settings.tag_mode == "overwrite_all" else "completed"
             self.log("OK", f"Tags {mode} for {path.name} via {meta.source}: {result.describe()}")
             try:
@@ -413,6 +488,8 @@ class BatchProcessor:
                     "cover": result.cover_written, "source": meta.source}))
             except Exception:
                 logger.exception("emit failed")
+            if result.cover_written:
+                self._cache_artwork(path)
             return True
         self.log(TAG_TAGS, f"{path.name}: tags were already complete")
         return False
@@ -778,14 +855,14 @@ class BatchProcessor:
         if not ok:
             raise ValueError(f"refusing to write invalid LRC ({reason})")
         settings = self.settings
+        resolved_language = language or self._text_language(strip_to_plain(lrc_text))
         wrote_lrc = False
         if settings.wants_lrc_file:
             self._write_lrc_file(lrc_path, lrc_text, source)
             wrote_lrc = True
         embedded: Optional[EmbedResult] = None
         if settings.wants_embedded:
-            embedded = embed_lyrics(path, lrc_text,
-                                    language=language or self._text_language(strip_to_plain(lrc_text)))
+            embedded = embed_lyrics(path, lrc_text, language=resolved_language)
             self._log_embed(path, embedded)
             if not embedded.ok and not wrote_lrc:
                 # embed-only mode, but this file cannot be tagged: never lose the result
@@ -793,7 +870,8 @@ class BatchProcessor:
                 self._write_lrc_file(lrc_path, lrc_text, source)
                 wrote_lrc = True
         self._record(self._fingerprint_after(path, fingerprint, embedded), track, status,
-                     source=source, lrc_path=lrc_path if wrote_lrc else None, ai_tried=ai_tried)
+                     source=source, lrc_path=lrc_path if wrote_lrc else None, ai_tried=ai_tried,
+                     language=resolved_language or "")
         self._announce_saved(path, lrc_text, status, source)
         return status
 
@@ -834,6 +912,8 @@ class BatchProcessor:
             self._prepare_isolation()
             self._progress(0, 1, path.name)
             self._clear_language()
+            self._track_event("track_start", path,
+                              "isolating" if self.settings.isolate_vocals else "syncing")
             status = self._custom_track(path, lyrics_text)
         except OperationCancelled:
             status = Status.SKIPPED
@@ -844,6 +924,7 @@ class BatchProcessor:
         finally:
             self.summary.bump(status)
             self.summary.cancelled = self.cancel.is_set()
+            self._track_event("track_done", path, status.value)
             self._progress(1, 1, path.name)
             self._shutdown()
             self.emit(Event("done", message=f"{time.monotonic() - started:.0f}s",

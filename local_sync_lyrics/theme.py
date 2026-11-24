@@ -303,9 +303,98 @@ QMainWindow {{
     color: {text};
 }}
 QWidget#Root {{
+    background: transparent;
+    color: {text};
+}}
+QFrame#WindowFrame {{
     background: qlineargradient(x1:0, y1:0, x2:0.55, y2:1,
         stop:0 {bg_top}, stop:1 {bg_bottom});
+    border: 1px solid {border};
+    border-radius: 22px;
+}}
+QFrame#TitleBar {{
+    background: transparent;
+    border: none;
+    border-top-left-radius: 22px;
+    border-top-right-radius: 22px;
+}}
+QWidget#Body {{
+    background: transparent;
+}}
+QPushButton#TitleButton {{
+    background-color: transparent;
+    color: {text2};
+    border: none;
+    border-radius: 8px;
+    padding: 0px;
+    font-size: 14px;
+}}
+QPushButton#TitleButton:hover {{
+    background-color: {glass_hi};
     color: {text};
+}}
+QPushButton#CloseButton {{
+    background-color: transparent;
+    color: {text2};
+    border: none;
+    border-radius: 8px;
+    padding: 0px;
+    font-size: 14px;
+}}
+QPushButton#CloseButton:hover {{
+    background-color: {err};
+    color: #FFFFFF;
+}}
+QSizeGrip {{
+    background: transparent;
+}}
+QFrame#DropZone {{
+    background-color: {field};
+    border: 1.5px dashed {qss_color(with_alpha(p.accent, 0.55))};
+    border-radius: 16px;
+}}
+QFrame#DropZone:hover {{
+    background-color: {accent_soft};
+    border-color: {accent};
+}}
+QFrame#DropZone:disabled {{
+    border-color: {field_border};
+    background-color: {field};
+}}
+QLabel#DropGlyph {{
+    font-size: 26px;
+    font-weight: 700;
+    color: {accent_fg};
+}}
+QFrame#UpdateBanner {{
+    background-color: {accent_soft};
+    border: 1px solid {qss_color(with_alpha(p.accent, 0.50))};
+    border-radius: 14px;
+}}
+QListWidget#HistoryGrid {{
+    background: transparent;
+    border: none;
+    padding: 2px;
+}}
+QListWidget#HistoryGrid::item {{
+    background-color: {glass};
+    border: 1px solid {border};
+    border-radius: 16px;
+    padding: 10px;
+    margin: 4px;
+    color: {text};
+}}
+QListWidget#HistoryGrid::item:hover {{
+    background-color: {glass_hi};
+    border-color: {border_hi};
+}}
+QListWidget#HistoryGrid::item:selected {{
+    background-color: {accent_soft};
+    border: 1.5px solid {qss_color(with_alpha(p.accent, 0.62))};
+    color: {text};
+}}
+QTableWidget#QueueTable::item {{
+    padding: 7px 9px;
 }}
 QWidget#Page, QStackedWidget, QWidget#SettingsInner {{
     background: transparent;

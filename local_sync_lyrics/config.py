@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -50,6 +51,30 @@ from .app_paths import settings_path
 from .theme import DEFAULT_ACCENT, normalise_hex
 
 logger = logging.getLogger(__name__)
+
+# The single source of truth for the application version.  ``local_sync_lyrics``
+# re-exports it, ``build.py`` stamps it into the bundle and the updater compares
+# GitHub release tags against it.
+__version__ = "2.3.0"
+
+# --- updates & support ---------------------------------------------------------------
+# Change these two constants (or the setting in Settings) to point the in-app
+# updater at your own fork / release feed.
+DEFAULT_UPDATE_REPO = "Will22102s/Lyricist"
+GITHUB_RELEASES_URL = f"https://github.com/{DEFAULT_UPDATE_REPO}/releases"
+SUPPORT_LINKS: tuple[tuple[str, str], ...] = (
+    ("GitHub Sponsors", "https://github.com/sponsors/Will22102s"),
+    ("Ko-fi", "https://ko-fi.com/lyricist"),
+    ("Buy Me a Coffee", "https://www.buymeacoffee.com/lyricist"),
+)
+CREDITS = (
+    ("faster-whisper", "local speech-to-text and forced alignment"),
+    ("CTranslate2", "fast CPU / GPU Whisper inference"),
+    ("PySide6 (Qt 6)", "native desktop interface"),
+    ("mutagen", "audio tags, artwork and embedded lyrics"),
+    ("MusicBrainz + Cover Art Archive", "canonical tags and cover art"),
+    ("LRCLIB & the other lyric providers", "synced and plain lyrics"),
+)
 
 # Search order = tier order. Tier 1 returns ready-made synced .lrc files; Tier 2 returns
 # plain official text that must be timestamped by forced alignment.
@@ -234,6 +259,12 @@ class Settings:
     theme_mode: str = "dark"             # dark | light | system
     accent_preset: str = DEFAULT_ACCENT_PRESET   # a preset id or "custom"
     custom_accent: str = DEFAULT_ACCENT          # #RRGGBB, used when accent_preset == "custom"
+
+    # --- Phase 4: updates & support ---------------------------------------
+    auto_check_updates: bool = True
+    update_repo: str = DEFAULT_UPDATE_REPO       # owner/name on GitHub
+    last_update_check: float = 0.0               # unix time of the last successful check
+
     settings_version: int = SETTINGS_VERSION
 
     # not persisted: which fields were filled from the environment
@@ -357,6 +388,14 @@ class Settings:
         self.custom_accent = normalise_hex(self.custom_accent, DEFAULT_ACCENT)
         if self.accent_preset not in ACCENT_PRESET_IDS and self.accent_preset != CUSTOM_ACCENT_ID:
             self.accent_preset = DEFAULT_ACCENT_PRESET
+        repo = (self.update_repo or DEFAULT_UPDATE_REPO).strip().strip("/")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+            repo = DEFAULT_UPDATE_REPO
+        self.update_repo = repo
+        try:
+            self.last_update_check = max(0.0, float(self.last_update_check or 0.0))
+        except (TypeError, ValueError):
+            self.last_update_check = 0.0
         self.settings_version = SETTINGS_VERSION
 
 

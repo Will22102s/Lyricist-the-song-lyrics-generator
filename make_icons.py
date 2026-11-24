@@ -19,7 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / "assets"
-OUTPUTS = ("logo.svg", "logo.png", "logo.ico")
+OUTPUTS = ("logo.svg", "logo.png", "logo.ico", "icon.png", "icon.ico")
 SOURCES = (ROOT / "local_sync_lyrics" / "branding.py", ROOT / "local_sync_lyrics" / "theme.py")
 
 

@@ -130,6 +130,27 @@ def logo_svg(accent: str = DEFAULT_ACCENT) -> str:
 
 
 # ----------------------------------------------------------------------- Pillow
+def write_icns(path: str | Path, accent: str = DEFAULT_ACCENT) -> Path:
+    """Write a standards-compliant macOS ``.icns`` (PNG payloads, no Pillow ICNS writer).
+
+    Pillow's own ICNS encoder produces a table Qt/iconutil rejects; the container is
+    simple enough to write directly.
+    """
+    import io
+
+    target = Path(path)
+    entries: list[bytes] = []
+    for kind, size in (("icp4", 16), ("icp5", 32), ("icp6", 64), ("ic07", 128),
+                       ("ic08", 256), ("ic09", 512), ("ic10", 1024)):
+        buffer = io.BytesIO()
+        render_png(accent, size).save(buffer, format="PNG", optimize=True)
+        payload = buffer.getvalue()
+        entries.append(kind.encode("ascii") + (len(payload) + 8).to_bytes(4, "big") + payload)
+    body = b"".join(entries)
+    target.write_bytes(b"icns" + (len(body) + 8).to_bytes(4, "big") + body)
+    return target
+
+
 def render_png(accent: str = DEFAULT_ACCENT, size: int = 512):
     """Render the logo with Pillow (4x supersampled). Returns a ``PIL.Image`` (RGBA)."""
     from PIL import Image, ImageDraw  # lazy: only needed when building assets
@@ -206,7 +227,11 @@ def render_png(accent: str = DEFAULT_ACCENT, size: int = 512):
 
 
 def write_assets(out_dir: str | Path, accent: str = DEFAULT_ACCENT) -> dict[str, Path]:
-    """Write ``logo.svg``, ``logo.png`` (512) and a multi-size ``logo.ico`` into *out_dir*."""
+    """Write the logo plus platform-named icons into *out_dir*.
+
+    ``logo.*`` keeps the historical names used by the GUI; ``icon.png`` / ``icon.ico`` /
+    ``icon.icns`` are the names PyInstaller and the OS file managers expect.
+    """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     svg = out / "logo.svg"
@@ -218,4 +243,18 @@ def write_assets(out_dir: str | Path, accent: str = DEFAULT_ACCENT) -> dict[str,
     frames = [render_png(accent, s) for s in ICO_SIZES]
     frames[-1].save(ico, format="ICO", sizes=[(s, s) for s in ICO_SIZES],
                     append_images=frames[:-1])
-    return {"svg": svg, "png": png, "ico": ico}
+
+    paths = {"svg": svg, "png": png, "ico": ico}
+    icon_png = out / "icon.png"
+    icon_png.write_bytes(png.read_bytes())
+    paths["icon_png"] = icon_png
+    icon_ico = out / "icon.ico"
+    icon_ico.write_bytes(ico.read_bytes())
+    paths["icon_ico"] = icon_ico
+
+    # macOS bundle icon (written directly so Qt/iconutil accept the container).
+    try:
+        paths["icns"] = write_icns(out / "icon.icns", accent)
+    except Exception:
+        pass
+    return paths

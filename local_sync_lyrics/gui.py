@@ -22,55 +22,102 @@ Threading model
 from __future__ import annotations
 
 import logging
+import math
 import os
+import re
+import subprocess
 import sys
 import threading
+import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from PySide6.QtCore import (
-    QObject, QRunnable, Qt, QThread, QThreadPool, QTimer, Signal, Slot,
+    QEasingCurve, QObject, QPointF, QProcess, QPropertyAnimation, QRunnable, QRectF, QSize,
+    Qt, QThread, QThreadPool, QTimer, QUrl, Signal, Slot,
 )
 from PySide6.QtGui import (
-    QColor, QFont, QGuiApplication, QIcon, QPixmap, QTextCharFormat, QTextCursor,
+    QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QImage, QKeySequence,
+    QPainter, QPen, QPixmap, QShortcut, QTextCharFormat, QTextCursor,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog,
-    QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-    QScrollArea, QSizePolicy, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QFileDialog, QFormLayout, QFrame, QGraphicsDropShadowEffect, QGraphicsOpacityEffect,
+    QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
+    QPushButton, QScrollArea, QSizeGrip, QSizePolicy, QSpinBox, QStackedWidget,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import __version__
 from .api_providers import test_custom_provider
 from .app_paths import asset_path, data_dir, database_path, logs_dir
 from .config import (
-    ACCENT_PRESETS, CUSTOM_ACCENT_ID, OUTPUT_MODE_LABELS, OUTPUT_MODES, PROVIDER_IDS,
-    TAG_MODE_LABELS, TAG_MODES, TIER1_IDS, TIER2_IDS, CustomProvider, Settings,
-    SettingsStore, find_accent_preset,
+    ACCENT_PRESETS, CREDITS, CUSTOM_ACCENT_ID, GITHUB_RELEASES_URL, OUTPUT_MODE_LABELS,
+    OUTPUT_MODES, PROVIDER_IDS, SUPPORT_LINKS, TAG_MODE_LABELS, TAG_MODES, TIER1_IDS,
+    TIER2_IDS, CustomProvider, Settings, SettingsStore, find_accent_preset,
 )
-from .database import LyricsDatabase, clear_cache_file
+from .database import HistoryRecord, LyricsDatabase, clear_cache_file
 from .hardware_profiler import HardwareProfile, get_profile, run_preflight
 from .language import detect_text_language
 from .lrc_utils import (
     LrcLine, compose_lrc, format_timestamp, parse_timestamp, repair_lrc, split_lrc,
+    write_text_atomic,
 )
 from .metadata import read_embedded_lyrics, save_lyrics
 from .models import Event
-from .processor import AUDIO_EXTENSIONS, BatchProcessor
+from .processor import AUDIO_EXTENSIONS, BatchProcessor, discover_audio
 from .theme import (
     Palette, build_palette, build_qss, darken, lighten, normalise_hex, on_color, parse_hex,
     qss_color, qss_hex, resolve_dark, with_alpha,
 )
+from .updater import UpdateInfo, check_for_update, release_notes
 
 logger = logging.getLogger(__name__)
 
 APP_TITLE = "Lyricist"
 MAX_LOG_LINES = 1500
 SIDEBAR_WIDTH = 236
+SHADOW_MARGIN = 18
+VIEWS = (
+    ("workspace", "Sync Workspace", "workspace"),
+    ("history", "History & Library", "history"),
+    ("providers", "Providers & Rules", "providers"),
+    ("settings", "Settings & About", "settings"),
+)
+QUEUE_STATUS = {
+    "queued": ("Queued", "text3"),
+    "isolating": ("Isolating Vocals", "accent"),
+    "syncing": ("Syncing", "accent"),
+    "tagging": ("Auto-Tagging", "warn"),
+    "done": ("Done", "ok"),
+    "error": ("Error", "err"),
+    "not_found": ("Not Found", "warn"),
+    "skipped": ("Skipped", "text3"),
+    "instrumental": ("Instrumental", "text3"),
+}
+HISTORY_STATUS = {
+    "all": "All tracks",
+    "synced_online": "Synced online",
+    "synced_aligned": "Synced (aligned)",
+    "synced_ai": "Synced (AI)",
+    "plain_only": "Plain text only",
+    "instrumental": "Instrumental",
+    "not_found": "Not found",
+    "failed": "Failed",
+}
+QUEUE_DONE_STATUS = {
+    "synced_online": "done",
+    "synced_aligned": "done",
+    "synced_ai": "done",
+    "plain_only": "done",
+    "not_found": "not_found",
+    "failed": "error",
+    "skipped": "skipped",
+    "instrumental": "instrumental",
+}
 
 LANGUAGES = [
     ("auto", "Auto-detect"), ("en", "English"), ("es", "Spanish"), ("fr", "French"),
@@ -124,6 +171,102 @@ def _icon_pixmap(size: int) -> Optional[QPixmap]:
     if pix.isNull():
         return None
     return pix.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+
+def _app_icon() -> QIcon:
+    """Best available high-resolution icon for the window/taskbar."""
+    if sys.platform.startswith("win"):
+        names = ("icon.ico", "logo.png")
+    elif sys.platform == "darwin":
+        names = ("icon.icns", "icon.png", "logo.png")
+    else:
+        names = ("icon.png", "logo.png")
+    for name in names:
+        path = asset_path(name)
+        if path is None:
+            continue
+        icon = QIcon(str(path))
+        if not icon.isNull():
+            return icon
+    return QIcon()
+
+
+def _vector_icon(kind: str, color: str, size: int = 22) -> QIcon:
+    """Crisp, DPI-aware line icons painted with QPainter (no SVG plugin needed)."""
+    ratio = 2
+    pix = QPixmap(size * ratio, size * ratio)
+    pix.setDevicePixelRatio(ratio)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    pen = QPen(QColor(color))
+    pen.setWidthF(1.75)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    centre = size / 2.0
+
+    if kind == "workspace":                      # two beamed eighth notes
+        painter.drawLine(QPointF(8.2, 16.0), QPointF(8.2, 5.4))
+        painter.drawLine(QPointF(16.0, 13.9), QPointF(16.0, 3.3))
+        painter.drawLine(QPointF(8.2, 5.4), QPointF(16.0, 3.3))
+        painter.drawLine(QPointF(8.2, 8.3), QPointF(16.0, 6.2))
+        painter.setBrush(QColor(color))
+        painter.drawEllipse(QPointF(6.0, 16.2), 2.3, 1.9)
+        painter.drawEllipse(QPointF(13.8, 14.1), 2.3, 1.9)
+    elif kind == "history":                      # clock with a back arrow
+        painter.drawArc(QRectF(4.2, 4.2, 14.2, 14.2), 35 * 16, 285 * 16)
+        painter.drawLine(QPointF(4.4, 7.2), QPointF(4.4, 3.6))
+        painter.drawLine(QPointF(4.4, 3.6), QPointF(8.0, 3.6))
+        painter.drawLine(QPointF(centre + 0.2, centre - 1.6), QPointF(centre + 0.2, centre + 1.8))
+        painter.drawLine(QPointF(centre + 0.2, centre + 1.8), QPointF(centre + 3.2, centre + 1.8))
+    elif kind == "providers":                    # sliders
+        for y, knob in ((6.4, 8.0), (11.0, 14.0), (15.6, 6.2)):
+            painter.drawLine(QPointF(3.8, y), QPointF(size - 3.8, y))
+            painter.setBrush(QColor(color))
+            painter.drawEllipse(QPointF(knob, y), 1.9, 1.9)
+            painter.setBrush(Qt.NoBrush)
+    else:                                        # settings: cog
+        painter.drawEllipse(QPointF(centre, centre), 4.4, 4.4)
+        for index in range(8):
+            angle = math.radians(index * 45)
+            inner, outer = 5.6, 8.0
+            painter.drawLine(
+                QPointF(centre + inner * math.cos(angle), centre + inner * math.sin(angle)),
+                QPointF(centre + outer * math.cos(angle), centre + outer * math.sin(angle)))
+        painter.setBrush(QColor(color))
+        painter.drawEllipse(QPointF(centre, centre), 1.5, 1.5)
+    painter.end()
+    return QIcon(pix)
+
+
+def _fallback_artwork(palette: Palette, size: int = 168) -> QPixmap:
+    """Placeholder album tile used when a track has no embedded cover art."""
+    pix = QPixmap(size, size)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    fill = QColor(palette.accent)
+    fill.setAlpha(52)
+    edge = QColor(palette.accent)
+    edge.setAlpha(110)
+    painter.setBrush(fill)
+    painter.setPen(QPen(edge, 1))
+    painter.drawRoundedRect(QRectF(0.5, 0.5, size - 1, size - 1), 22, 22)
+    pen = QPen(QColor(palette.accent_fg))
+    pen.setWidthF(3.0)
+    pen.setCapStyle(Qt.RoundCap)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    x = size * 0.38
+    painter.drawLine(QPointF(x, size * 0.68), QPointF(x, size * 0.32))
+    painter.drawLine(QPointF(x, size * 0.32), QPointF(size * 0.62, size * 0.27))
+    painter.setBrush(QColor(palette.accent_fg))
+    painter.drawEllipse(QPointF(x - size * 0.045, size * 0.70), size * 0.055, size * 0.045)
+    painter.drawEllipse(QPointF(size * 0.575, size * 0.66), size * 0.055, size * 0.045)
+    painter.end()
+    return pix
 
 
 def _label(text: str = "", name: Optional[str] = None, *, wrap: bool = False,
@@ -236,8 +379,8 @@ class BatchWorker(QThread):
     event = Signal(object)
     confirm = Signal(object)
 
-    def __init__(self, target: Path, settings: Settings, cancel: threading.Event,
-                 lyrics: Optional[str] = None) -> None:
+    def __init__(self, target: Path | list[Path], settings: Settings,
+                 cancel: threading.Event, lyrics: Optional[str] = None) -> None:
         super().__init__()
         self.target = target
         self.settings = settings
@@ -994,8 +1137,195 @@ class CustomProvidersDialog(QDialog):
         self._set_status(f"Test failed: {message}", ok=False)
 
 
+class TitleBar(QFrame):
+    """Frameless window chrome: drag, double-click maximise, minimise / close."""
+
+    def __init__(self, window: "MainWindow") -> None:
+        super().__init__(window)
+        self.setObjectName("TitleBar")
+        self.setFixedHeight(48)
+        self._window = window
+        self._drag_offset = None
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(18, 6, 10, 6)
+        row.setSpacing(10)
+
+        logo = QLabel()
+        pix = _icon_pixmap(26)
+        if pix is not None:
+            logo.setPixmap(pix)
+        else:
+            logo.setText("♪")
+        titles = QVBoxLayout()
+        titles.setSpacing(0)
+        titles.addWidget(_label(APP_TITLE, "Brand"))
+        titles.addWidget(_label("Synced lyrics, beautifully.", "Tiny"))
+        row.addWidget(logo)
+        row.addLayout(titles)
+        row.addStretch(1)
+
+        self.min_btn = self._title_button("—", "Minimise")
+        self.max_btn = self._title_button("▢", "Maximise")
+        self.close_btn = self._title_button("✕", "Close")
+        self.close_btn.setObjectName("CloseButton")
+        self.min_btn.clicked.connect(self._window.showMinimized)
+        self.max_btn.clicked.connect(self._window._toggle_maximised)
+        self.close_btn.clicked.connect(self._window.close)
+        row.addWidget(self.min_btn)
+        row.addWidget(self.max_btn)
+        row.addWidget(self.close_btn)
+
+    @staticmethod
+    def _title_button(glyph: str, tooltip: str) -> QPushButton:
+        button = QPushButton(glyph)
+        button.setObjectName("TitleButton")
+        button.setFixedSize(34, 30)
+        button.setToolTip(tooltip)
+        button.setCursor(Qt.PointingHandCursor)
+        return button
+
+    # ------------------------------------------------------------------ drag
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if event.button() == Qt.LeftButton:
+            handle = self.window().windowHandle()
+            if handle is not None:
+                try:
+                    if handle.startSystemMove():
+                        event.accept()
+                        return
+                except Exception:
+                    pass
+            self._drag_offset = (event.globalPosition().toPoint()
+                                 - self.window().frameGeometry().topLeft())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
+            self.window().move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt API
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if event.button() == Qt.LeftButton:
+            self._window._toggle_maximised()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+class DropZone(QFrame):
+    """Accept folders and audio files dragged from the file manager."""
+
+    pathsDropped = Signal(list)
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("DropZone")
+        self.setAcceptDrops(True)
+        self.setMinimumHeight(78)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(18, 12, 18, 12)
+        row.setSpacing(14)
+        glyph = QLabel("⇩")
+        glyph.setObjectName("DropGlyph")
+        text = QVBoxLayout()
+        text.setSpacing(1)
+        text.addWidget(_label("Drop audio files or folders here", "Heading"))
+        text.addWidget(_label("MP3 · FLAC · M4A · WAV · OGG · Opus  -  folders are scanned "
+                              "recursively", "Tiny"))
+        row.addWidget(glyph)
+        row.addLayout(text, 1)
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt API
+        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+        if paths:
+            self.pathsDropped.emit(paths)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+
+class UpdateCheckThread(QThread):
+    """Runs the GitHub API call off the UI thread."""
+
+    checked = Signal(object)   # UpdateInfo
+
+    def __init__(self, current: str, repo: str, parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
+        self.current = current
+        self.repo = repo
+
+    def run(self) -> None:  # noqa: D102 - QThread API
+        try:
+            info = check_for_update(self.current, self.repo)
+        except Exception as exc:  # check_for_update is defensive, belt and braces
+            info = UpdateInfo(current=self.current, error=str(exc))
+        self.checked.emit(info)
+
+
+class UpdateDialog(QDialog):
+    """Non-blocking-style update details with the changelog and a download button."""
+
+    def __init__(self, info: UpdateInfo, palette: Palette,
+                 parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("EditorDialog")
+        self.setWindowTitle("Update available")
+        self.resize(680, 560)
+        self.setMinimumSize(520, 420)
+        self.info = info
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 22, 24, 20)
+        root.setSpacing(12)
+        root.addWidget(_label(f"Lyricist v{info.latest} is available", "Title"))
+        root.addWidget(_label(f"You are running v{info.current}.", "Caption"))
+        if info.asset_name:
+            root.addWidget(_label(f"Download: {info.asset_name}", "Tiny", selectable=True))
+
+        notes = QPlainTextEdit()
+        notes.setObjectName("RawLrc")
+        notes.setReadOnly(True)
+        notes.setPlainText(release_notes(info))
+        root.addWidget(notes, 1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        later = _button("Later", "Glass")
+        later.clicked.connect(self.reject)
+        download = _button("Open Download Page", "Primary")
+        download.clicked.connect(self._download)
+        buttons.addWidget(later)
+        buttons.addWidget(download)
+        root.addLayout(buttons)
+
+    def _download(self) -> None:
+        QDesktopServices.openUrl(QUrl(self.info.download_url))
+        self.accept()
+
+
 class MainWindow(QMainWindow):
-    """The whole application window (sidebar + workspace + settings)."""
+    """The whole application window (titlebar + sidebar + four views)."""
 
     def __init__(self, store: Optional[SettingsStore] = None,
                  settings: Optional[Settings] = None) -> None:
@@ -1024,19 +1354,37 @@ class MainWindow(QMainWindow):
         self.editor_dialog: Optional[LyricEditorDialog] = None
         self._last_saved: Optional[dict[str, str]] = None
 
+        # --- Phase 4 state ------------------------------------------------
+        self.update_checker: Optional[UpdateCheckThread] = None
+        self.update_info: Optional[UpdateInfo] = None
+        self._update_manual = False
+        self._view_anim: Optional[QPropertyAnimation] = None
+        self.history_entries: list[HistoryRecord] = []
+        self.history_job_running = False
+        self._history_pending = False
+        self._history_images: dict[str, QImage] = {}
+        self.queue_paths: list[Path] = []
+        self.queue_rows: dict[str, int] = {}
+        self._current_track = ""
+        self._queue_from_folder = False
+        self._fallback_art: Optional[QPixmap] = None
+        self._shadow: Optional[QGraphicsDropShadowEffect] = None
+        self._shortcuts: list[QShortcut] = []
+
         self.palette = build_palette(resolve_dark(self.settings.theme_mode, _system_is_dark()),
                                      self.settings.accent_color())
 
         self.setWindowTitle(APP_TITLE)
-        self.resize(1180, 820)
-        self.setMinimumSize(1020, 700)
-        icon = asset_path("logo.png")
-        if icon is not None:
-            self.setWindowIcon(QIcon(str(icon)))
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.resize(1280, 860)
+        self.setMinimumSize(1060, 720)
+        self.setWindowIcon(_app_icon())
 
         self._build_ui()
         self._apply_settings_to_controls()
         self._apply_theme()
+        self._install_shortcuts()
 
         self._log_bridge = QtLogBridge()
         self._log_bridge.message.connect(self._on_log_record)
@@ -1054,20 +1402,48 @@ class MainWindow(QMainWindow):
         root = QWidget()
         root.setObjectName("Root")
         self.setCentralWidget(root)
+        self._root_layout = QVBoxLayout(root)
+        self._root_layout.setContentsMargins(SHADOW_MARGIN, SHADOW_MARGIN,
+                                             SHADOW_MARGIN, SHADOW_MARGIN)
+        self._root_layout.setSpacing(0)
 
-        outer = QHBoxLayout(root)
-        outer.setContentsMargins(16, 16, 16, 16)
-        outer.setSpacing(16)
+        self.window_frame = QFrame()
+        self.window_frame.setObjectName("WindowFrame")
+        self._shadow = QGraphicsDropShadowEffect(self.window_frame)
+        self._shadow.setBlurRadius(42)
+        self._shadow.setOffset(0, 12)
+        self._shadow.setColor(QColor(0, 0, 0, 120))
+        self.window_frame.setGraphicsEffect(self._shadow)
+        self._root_layout.addWidget(self.window_frame)
 
-        outer.addWidget(self._build_sidebar())
+        frame_layout = QVBoxLayout(self.window_frame)
+        frame_layout.setContentsMargins(0, 0, 0, 0)
+        frame_layout.setSpacing(0)
+        self.title_bar = TitleBar(self)
+        frame_layout.addWidget(self.title_bar)
+
+        body = QWidget()
+        body.setObjectName("Body")
+        body_layout = QHBoxLayout(body)
+        body_layout.setContentsMargins(16, 6, 16, 16)
+        body_layout.setSpacing(16)
+        body_layout.addWidget(self._build_sidebar())
 
         self.stack = QStackedWidget()
         self.stack.setObjectName("Stack")
         self.workspace_view = self._build_workspace()
+        self.history_view = self._build_history()
+        self.providers_view = self._build_providers_view()
         self.settings_view = self._build_settings()
-        self.stack.addWidget(self.workspace_view)
-        self.stack.addWidget(self.settings_view)
-        outer.addWidget(self.stack, 1)
+        for view in (self.workspace_view, self.history_view,
+                     self.providers_view, self.settings_view):
+            self.stack.addWidget(view)
+        body_layout.addWidget(self.stack, 1)
+        frame_layout.addWidget(body, 1)
+
+        self.size_grip = QSizeGrip(self.window_frame)
+        self.size_grip.setFixedSize(18, 18)
+        self.size_grip.raise_()
 
         self.toast = QFrame(root)
         self.toast.setObjectName("Toast")
@@ -1084,7 +1460,7 @@ class MainWindow(QMainWindow):
         sidebar.setFixedWidth(SIDEBAR_WIDTH)
         box = QVBoxLayout(sidebar)
         box.setContentsMargins(18, 22, 18, 18)
-        box.setSpacing(14)
+        box.setSpacing(12)
 
         brand_row = QHBoxLayout()
         brand_row.setSpacing(12)
@@ -1102,13 +1478,15 @@ class MainWindow(QMainWindow):
         brand_row.addWidget(logo)
         brand_row.addLayout(titles, 1)
         box.addLayout(brand_row)
-        box.addSpacing(8)
+        box.addSpacing(6)
 
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
         self.nav_buttons: dict[str, QPushButton] = {}
-        for key, text in (("workspace", "  Sync Workspace"), ("settings", "  Settings")):
-            button = _button(text, "Nav", checkable=True)
+        for key, text, icon_kind in VIEWS:
+            button = _button(f"  {text}", "Nav", checkable=True)
+            button.setIconSize(QSize(20, 20))
+            button.setProperty("iconKind", icon_kind)
             button.clicked.connect(lambda _=False, k=key: self._show_view(k))
             self.nav_group.addButton(button)
             self.nav_buttons[key] = button
@@ -1116,6 +1494,10 @@ class MainWindow(QMainWindow):
         self.nav_buttons["workspace"].setChecked(True)
 
         box.addStretch(1)
+
+        self.update_badge = _label("", "Tiny", wrap=True)
+        self.update_badge.setVisible(False)
+        box.addWidget(self.update_badge)
 
         self.hw_badge = _label("Analysing hardware…", "Tiny", wrap=True)
         box.addWidget(self.hw_badge)
@@ -1158,6 +1540,23 @@ class MainWindow(QMainWindow):
         header.addWidget(status_pill)
         box.addLayout(header)
 
+        # update banner --------------------------------------------------------
+        self.update_banner = QFrame()
+        self.update_banner.setObjectName("UpdateBanner")
+        update_layout = QHBoxLayout(self.update_banner)
+        update_layout.setContentsMargins(14, 10, 14, 10)
+        update_layout.setSpacing(10)
+        self.update_text = _label("", "BannerText", wrap=True)
+        self.update_view_btn = _button("What's new", "Quiet")
+        self.update_view_btn.clicked.connect(self._open_update_dialog)
+        self.update_dismiss_btn = _button("Dismiss", "Quiet")
+        self.update_dismiss_btn.clicked.connect(self._dismiss_update_banner)
+        update_layout.addWidget(self.update_text, 1)
+        update_layout.addWidget(self.update_view_btn)
+        update_layout.addWidget(self.update_dismiss_btn)
+        self.update_banner.setVisible(False)
+        box.addWidget(self.update_banner)
+
         # pre-flight banner ----------------------------------------------------
         self.banner = QFrame()
         self.banner.setObjectName("Banner")
@@ -1168,12 +1567,19 @@ class MainWindow(QMainWindow):
         self.banner.setVisible(False)
         box.addWidget(self.banner)
 
+        # drop zone ------------------------------------------------------------
+        self.drop_zone = DropZone()
+        self.drop_zone.pathsDropped.connect(self._on_paths_dropped)
+        box.addWidget(self.drop_zone)
+
         # library card ---------------------------------------------------------
         self.folder_field = QLineEdit()
         self.folder_field.setPlaceholderText("Music folder - browse… or paste a path")
         self.folder_field.returnPressed.connect(self._start_batch)
         self.browse_btn = _button("Browse…", "Glass")
         self.browse_btn.clicked.connect(self._browse)
+        self.add_files_btn = _button("Add files…", "Glass")
+        self.add_files_btn.clicked.connect(self._add_files)
         self.start_btn = _button("Start sync", "Primary")
         self.start_btn.clicked.connect(self._start_batch)
         self.stop_btn = _button("Stop", "Danger")
@@ -1184,6 +1590,7 @@ class MainWindow(QMainWindow):
         folder_row.setSpacing(10)
         folder_row.addWidget(self.folder_field, 1)
         folder_row.addWidget(self.browse_btn)
+        folder_row.addWidget(self.add_files_btn)
         folder_row.addWidget(self.start_btn)
         folder_row.addWidget(self.stop_btn)
 
@@ -1225,6 +1632,53 @@ class MainWindow(QMainWindow):
 
         library = self._card(_vbox(folder_row, output_row, isolate_row, tag_row, spacing=12))
         box.addWidget(library)
+
+        # queue card -----------------------------------------------------------
+        queue_header = QHBoxLayout()
+        queue_header.setSpacing(8)
+        queue_header.addWidget(_label("Sync queue", "SectionLabel"))
+        self.queue_count = _label("No tracks queued", "Tiny")
+        queue_header.addWidget(self.queue_count)
+        queue_header.addStretch(1)
+        self.queue_clear_btn = _button("Clear", "Quiet")
+        self.queue_clear_btn.clicked.connect(self._queue_clear)
+        queue_header.addWidget(self.queue_clear_btn)
+
+        self.queue_table = QTableWidget(0, 4)
+        self.queue_table.setObjectName("QueueTable")
+        self.queue_table.setHorizontalHeaderLabels(["Track", "Status", "Language", "Folder"])
+        self.queue_table.verticalHeader().setVisible(False)
+        self.queue_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.queue_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.queue_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.queue_table.setAlternatingRowColors(True)
+        self.queue_table.setMinimumHeight(138)
+        self.queue_table.setMaximumHeight(210)
+        queue_head = self.queue_table.horizontalHeader()
+        queue_head.setSectionResizeMode(0, QHeaderView.Stretch)
+        queue_head.setSectionResizeMode(1, QHeaderView.Fixed)
+        queue_head.setSectionResizeMode(2, QHeaderView.Fixed)
+        queue_head.setSectionResizeMode(3, QHeaderView.Fixed)
+        self.queue_table.setColumnWidth(1, 142)
+        self.queue_table.setColumnWidth(2, 96)
+        self.queue_table.setColumnWidth(3, 190)
+        self.queue_table.itemSelectionChanged.connect(self._queue_selection_changed)
+        self.queue_table.itemDoubleClicked.connect(lambda *_: self._queue_open_editor())
+
+        queue_actions = QHBoxLayout()
+        queue_actions.setSpacing(8)
+        self.queue_edit_btn = _button("Edit Lyrics", "Glass")
+        self.queue_edit_btn.clicked.connect(self._queue_open_editor)
+        self.queue_location_btn = _button("Open Location", "Quiet")
+        self.queue_location_btn.clicked.connect(self._queue_open_location)
+        self.queue_remove_btn = _button("Remove", "Danger")
+        self.queue_remove_btn.clicked.connect(self._queue_remove_selected)
+        for button in (self.queue_edit_btn, self.queue_location_btn, self.queue_remove_btn):
+            button.setEnabled(False)
+            queue_actions.addWidget(button)
+        queue_actions.addStretch(1)
+        queue_card = self._card(_vbox(queue_header, self.queue_table, queue_actions, spacing=8))
+        box.addWidget(queue_card)
 
         # progress card --------------------------------------------------------
         self.progress_card = QFrame()
@@ -1329,8 +1783,8 @@ class MainWindow(QMainWindow):
         box.setContentsMargins(6, 4, 6, 4)
         box.setSpacing(14)
 
-        titles = _vbox(_label("Settings", "Title"),
-                       _label("Appearance, local AI and the lyrics pipeline", "Caption"), spacing=2)
+        titles = _vbox(_label("Settings & About", "Title"),
+                       _label("Appearance, local AI, updates and support", "Caption"), spacing=2)
         self.clear_cache_btn = _button("Clear cache", "Glass")
         self.clear_cache_btn.clicked.connect(self._clear_cache)
         self.save_btn = _button("Save settings", "Primary")
@@ -1353,14 +1807,127 @@ class MainWindow(QMainWindow):
 
         column.addWidget(self._build_appearance_card())
         column.addWidget(self._build_ai_card())
-        column.addWidget(self._build_pipeline_card())
-        column.addWidget(self._build_providers_card())
-        column.addWidget(self._build_tags_card())
-        column.addWidget(self._build_batch_card())
         column.addWidget(self._build_about_card())
         column.addStretch(1)
         scroll.setWidget(inner)
         box.addWidget(scroll, 1)
+        return page
+
+    # ------------------------------------------------------- providers & rules
+    def _build_providers_view(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName("Page")
+        box = QVBoxLayout(page)
+        box.setContentsMargins(6, 4, 6, 4)
+        box.setSpacing(14)
+
+        titles = _vbox(_label("Providers & Rules", "Title"),
+                       _label("Lyrics sources, smart-pipeline rules, tagging and batch behaviour",
+                              "Caption"), spacing=2)
+        save = _button("Save changes", "Primary")
+        save.clicked.connect(self._save_settings)
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        header.addLayout(titles, 1)
+        header.addWidget(save)
+        box.addLayout(header)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        inner = QWidget()
+        inner.setObjectName("SettingsInner")
+        column = QVBoxLayout(inner)
+        column.setContentsMargins(2, 2, 10, 8)
+        column.setSpacing(14)
+        column.addWidget(self._build_pipeline_card())
+        column.addWidget(self._build_providers_card())
+        column.addWidget(self._build_tags_card())
+        column.addWidget(self._build_batch_card())
+        column.addStretch(1)
+        scroll.setWidget(inner)
+        box.addWidget(scroll, 1)
+        return page
+
+    # ------------------------------------------------------- history & library
+    def _build_history(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName("Page")
+        box = QVBoxLayout(page)
+        box.setContentsMargins(6, 4, 6, 4)
+        box.setSpacing(14)
+
+        titles = _vbox(_label("History & Library", "Title"),
+                       _label("Every track Lyricist has synced - with its cover art and "
+                              "one-click actions", "Caption"), spacing=2)
+        self.history_refresh_btn = _button("Refresh", "Glass")
+        self.history_refresh_btn.clicked.connect(self._reload_history)
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        header.addLayout(titles, 1)
+        header.addWidget(self.history_refresh_btn)
+        box.addLayout(header)
+
+        self.history_search = QLineEdit()
+        self.history_search.setPlaceholderText("Search title, artist, album or path…")
+        self.history_search.setClearButtonEnabled(True)
+        self.history_filter = QComboBox()
+        for key, text in HISTORY_STATUS.items():
+            self.history_filter.addItem(text, key)
+        self.history_filter.setFixedWidth(190)
+        self.history_count_label = _label("", "Tiny")
+        filters = QHBoxLayout()
+        filters.setSpacing(10)
+        filters.addWidget(self.history_search, 1)
+        filters.addWidget(self.history_filter)
+        filters.addWidget(self.history_count_label)
+        box.addLayout(filters)
+
+        self._history_timer = QTimer(self)
+        self._history_timer.setSingleShot(True)
+        self._history_timer.setInterval(260)
+        self._history_timer.timeout.connect(self._reload_history)
+        self.history_search.textChanged.connect(lambda *_: self._history_timer.start())
+        self.history_filter.currentIndexChanged.connect(lambda *_: self._reload_history())
+
+        self.history_list = QListWidget()
+        self.history_list.setObjectName("HistoryGrid")
+        self.history_list.setViewMode(QListWidget.IconMode)
+        self.history_list.setResizeMode(QListWidget.Adjust)
+        self.history_list.setMovement(QListWidget.Static)
+        self.history_list.setIconSize(QSize(156, 156))
+        self.history_list.setGridSize(QSize(214, 262))
+        self.history_list.setSpacing(8)
+        self.history_list.setWordWrap(True)
+        self.history_list.setUniformItemSizes(True)
+        self.history_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.history_list.itemSelectionChanged.connect(self._history_selection_changed)
+        self.history_list.itemDoubleClicked.connect(lambda *_: self._history_open_editor())
+        box.addWidget(self.history_list, 1)
+
+        self.history_empty = _label(
+            "No tracks yet - sync a folder or drop a few songs to build your library.",
+            "Caption", wrap=True)
+        self.history_empty.setAlignment(Qt.AlignCenter)
+        self.history_empty.setVisible(False)
+        box.addWidget(self.history_empty, 1)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self.history_edit_btn = _button("Open in Lyric Editor", "Primary")
+        self.history_edit_btn.clicked.connect(self._history_open_editor)
+        self.history_location_btn = _button("Open File Location", "Glass")
+        self.history_location_btn.clicked.connect(self._history_open_location)
+        self.history_resync_btn = _button("Re-Sync Track", "Glass")
+        self.history_resync_btn.clicked.connect(self._history_resync)
+        self.history_export_btn = _button("Export .lrc", "Glass")
+        self.history_export_btn.clicked.connect(self._history_export)
+        for button in (self.history_edit_btn, self.history_location_btn,
+                       self.history_resync_btn, self.history_export_btn):
+            button.setEnabled(False)
+            actions.addWidget(button)
+        actions.addStretch(1)
+        box.addLayout(actions)
         return page
 
     def _build_appearance_card(self) -> QWidget:
@@ -1521,14 +2088,49 @@ class MainWindow(QMainWindow):
             logo.setStyleSheet("font-size: 40px;")
         self.data_path_text = _label("Data folder: …", "Tiny", wrap=True, selectable=True)
         self.logs_path_text = _label("Log files: …", "Tiny", wrap=True, selectable=True)
+        self.hw_summary = _label("Hardware: analysing…", "Caption", wrap=True, selectable=True)
         text = _vbox(_label(APP_TITLE, "Heading"),
-                     _label(f"Version {__version__}  ·  Qt / Liquid Glass interface", "Caption"),
-                     self.data_path_text, self.logs_path_text, spacing=3)
-        row = QHBoxLayout()
-        row.setSpacing(18)
-        row.addWidget(logo)
-        row.addLayout(text, 1)
-        return self._card(row)
+                     _label(f"Version {__version__}  ·  Qt 6 / Liquid Glass interface",
+                            "Caption"),
+                     self.hw_summary, self.data_path_text, self.logs_path_text, spacing=3)
+        brand = QHBoxLayout()
+        brand.setSpacing(18)
+        brand.addWidget(logo)
+        brand.addLayout(text, 1)
+
+        credits = _label(
+            "Built with " + ", ".join(name for name, _ in CREDITS) + ". Thank you to every "
+            "open-source maintainer who made this possible.", "Tiny", wrap=True)
+
+        support_row = QHBoxLayout()
+        support_row.setSpacing(8)
+        for label, url in SUPPORT_LINKS:
+            button = _button(label, "Quiet")
+            button.clicked.connect(lambda _=False, target=url: QDesktopServices.openUrl(QUrl(target)))
+            support_row.addWidget(button)
+        support_row.addStretch(1)
+
+        self.sw_updates = QCheckBox("Automatically check for updates at startup")
+        self.sw_updates.toggled.connect(self._toggle_auto_updates)
+        self.check_updates_btn = _button("Check Now", "Glass")
+        self.check_updates_btn.clicked.connect(lambda: self._check_updates(manual=True))
+        self.update_status = _label("Updates are checked against GitHub Releases.", "Tiny", wrap=True)
+        update_row = QHBoxLayout()
+        update_row.setSpacing(10)
+        update_row.addWidget(self.sw_updates, 1)
+        update_row.addWidget(self.check_updates_btn)
+
+        body = _vbox(
+            brand,
+            _label("About & Support", "SectionLabel"),
+            credits,
+            support_row,
+            _label("Updates", "SectionLabel"),
+            update_row,
+            self.update_status,
+            spacing=10)
+        return self._card(body, title="About Lyricist",
+                          caption="Version, hardware profile, credits and ways to support the project.")
 
     # ---------------------------------------------------------------- factories
     def _card(self, body: Any, *, title: Optional[str] = None,
@@ -1576,12 +2178,27 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.setStyleSheet(build_qss(self.palette))
+        self._fallback_art = None
+        if self._shadow is not None:
+            self._shadow.setColor(QColor(0, 0, 0, 90 if not self.palette.dark else 135))
         self._refresh_status()
         self._refresh_appearance()
         self._refresh_output()
         self._refresh_stat_colors()
+        self._refresh_nav_icons()
+        self._refresh_queue_colors()
         self._rebuild_log()
         self._update_toast_style()
+        if self.history_entries:
+            self._reload_history()
+
+    def _refresh_nav_icons(self) -> None:
+        """Tint the active sidebar icon with the accent, the others with body text."""
+        if not hasattr(self, "nav_buttons"):
+            return
+        for key, button in self.nav_buttons.items():
+            colour = self.palette.accent if key == self.view_name else self.palette.text2
+            button.setIcon(_vector_icon(button.property("iconKind") or key, colour, 20))
 
     def _refresh_stat_colors(self) -> None:
         for value in self.stat_values.values():
@@ -1638,6 +2255,20 @@ class MainWindow(QMainWindow):
             f" border: 1px solid {qss_color(self.palette.border_hi)}; border-radius: 14px; }}")
         self.toast_label.setStyleSheet(f"color: {qss_hex(self.palette.text)};")
 
+    def _queue_status_color(self, key: str) -> str:
+        attr = QUEUE_STATUS.get(key, ("", "text3"))[1]
+        return getattr(self.palette, attr, self.palette.text)
+
+    def _refresh_queue_colors(self) -> None:
+        if not hasattr(self, "queue_table"):
+            return
+        for row in range(self.queue_table.rowCount()):
+            item = self.queue_table.item(row, 1)
+            if item is None:
+                continue
+            key = item.data(Qt.UserRole + 1) or "queued"
+            item.setForeground(QColor(self._queue_status_color(key)))
+
     # ================================================================== jobs
     def _start_job(self, job: Job) -> None:
         """Keep a Python reference to *job* until its signals have been delivered.
@@ -1693,6 +2324,12 @@ class MainWindow(QMainWindow):
         def profile_done(profile: Any) -> None:
             self.profile = profile
             self.hw_badge.setText(profile.badge())
+            gpu = (f" · GPU: {profile.gpu_name}"
+                   + (f" ({profile.gpu_vram_gb:.0f} GB VRAM)" if profile.gpu_vram_gb else "")
+                   if profile.gpu_name else "")
+            self.hw_summary.setText(
+                f"CPU: {profile.cpu_name or 'unknown'} · {profile.physical_cores} cores · "
+                f"{profile.ram_total_gb:.0f} GB RAM{gpu}")
             for line in profile.summary_lines():
                 self._append_log("WARN" if line.startswith("Note:") else "SYS", line,
                                  "warning" if line.startswith("Note:") else "info")
@@ -1706,6 +2343,12 @@ class MainWindow(QMainWindow):
             lambda msg: self._append_log("WARN", f"Hardware analysis failed: {msg}", "warning"),
             Qt.QueuedConnection)
         self._start_job(profile_job)
+
+        QTimer.singleShot(250, self._reload_history)
+        if (self.settings.auto_check_updates
+                and not os.environ.get("LYRICIST_NO_UPDATE_CHECK")
+                and os.environ.get("QT_QPA_PLATFORM") != "offscreen"):
+            QTimer.singleShot(1600, lambda: self._check_updates(manual=False))
 
     # ================================================================== log
     def _append_log(self, tag: str, message: str, level: str = "info") -> None:
@@ -1772,8 +2415,22 @@ class MainWindow(QMainWindow):
             self.current_file.setText("")
             self._status_after = "idle" if stopped else "done"
             self._snack(f"{verb}: {synced} track(s) synced.")
+            QTimer.singleShot(400, self._reload_history)
         elif event.kind == "finished":
             self._set_running(False)
+        elif event.kind == "track_start":
+            data = event.data or {}
+            self._current_track = str(data.get("path", ""))
+            self._queue_set_status(self._current_track, data.get("status") or "syncing")
+        elif event.kind == "track_done":
+            data = event.data or {}
+            path = str(data.get("path", ""))
+            status = str(data.get("status", ""))
+            self._queue_set_status(
+                path, QUEUE_DONE_STATUS.get(status, "queued"),
+                data.get("language_name") or data.get("language") or "")
+            if status in ("synced_online", "synced_aligned", "synced_ai", "plain_only"):
+                QTimer.singleShot(600, self._reload_history)
         elif event.kind == "toast":
             self._snack(event.message)
         elif event.kind == "language":
@@ -1797,6 +2454,7 @@ class MainWindow(QMainWindow):
             extra = " + cover art" if data.get("cover") else ""
             self._append_log("OK", f"Tags written for {event.message} via "
                                    f"{data.get('source', 'lookup')}: {fields}{extra}.")
+            self._queue_set_status(data.get("path", ""), "tagging")
 
     @Slot(object)
     def _on_event(self, event: Event) -> None:
@@ -1829,6 +2487,9 @@ class MainWindow(QMainWindow):
         self.sw_autotag.setEnabled(not running)
         self.tag_mode_dd.setEnabled(not running and self.sw_autotag.isChecked())
         self.custom_providers_btn.setEnabled(not running)
+        self.queue_clear_btn.setEnabled(not running)
+        self.drop_zone.setEnabled(not running)
+        self._queue_selection_changed()
         self._refresh_output()
         if running:
             self._status = "running"
@@ -1847,11 +2508,108 @@ class MainWindow(QMainWindow):
             self.progress_card.setVisible(False)
 
     def _show_view(self, name: str) -> None:
+        if name not in self.nav_buttons:
+            name = "workspace"
         self.view_name = name
-        self.stack.setCurrentWidget(self.workspace_view if name == "workspace" else self.settings_view)
+        target = {
+            "workspace": self.workspace_view,
+            "history": self.history_view,
+            "providers": self.providers_view,
+            "settings": self.settings_view,
+        }[name]
+        if self.stack.currentWidget() is not target:
+            self.stack.setCurrentWidget(target)
+            self._animate_view(target)
         button = self.nav_buttons.get(name)
-        if button is not None:
+        if button is not None and not button.isChecked():
             button.setChecked(True)
+        self._refresh_nav_icons()
+        if name == "history":
+            self._reload_history()
+
+    def _animate_view(self, view: QWidget) -> None:
+        """Short cross-fade when switching pages (native effects only, no blocking)."""
+        effect = QGraphicsOpacityEffect(view)
+        effect.setOpacity(0.0)
+        view.setGraphicsEffect(effect)
+        anim = QPropertyAnimation(effect, b"opacity", self)
+        anim.setDuration(170)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+
+        def finish() -> None:
+            try:
+                view.setGraphicsEffect(None)
+            except Exception:
+                pass
+            self._view_anim = None
+
+        anim.finished.connect(finish)
+        anim.start(QPropertyAnimation.DeleteWhenStopped)
+        self._view_anim = anim
+
+    # ------------------------------------------------------------- window chrome
+    def _toggle_maximised(self) -> None:
+        maximised = not self.isMaximized()
+        if maximised:
+            self.showMaximized()
+        else:
+            self.showNormal()
+        margin = 0 if maximised else SHADOW_MARGIN
+        self._root_layout.setContentsMargins(margin, margin, margin, margin)
+        if self._shadow is not None:
+            self._shadow.setEnabled(not maximised)
+        if hasattr(self, "size_grip"):
+            self.size_grip.setVisible(not maximised)
+
+    def _install_shortcuts(self) -> None:
+        bindings: tuple[tuple[str, Callable[[], Any]], ...] = (
+            ("Ctrl+O", self._browse),
+            ("Ctrl+Shift+O", self._add_files),
+            ("Ctrl+R", self._start_batch),
+            ("Ctrl+,", lambda: self._show_view("settings")),
+            ("Ctrl+1", lambda: self._show_view("workspace")),
+            ("Ctrl+2", lambda: self._show_view("history")),
+            ("Ctrl+3", lambda: self._show_view("providers")),
+            ("Ctrl+4", lambda: self._show_view("settings")),
+            ("Ctrl+E", self._queue_open_editor),
+            ("Ctrl+F", self._focus_search),
+            ("Ctrl+U", lambda: self._check_updates(manual=True)),
+            ("Escape", self._stop),
+            ("Ctrl+Q", self.close),
+        )
+        for sequence, slot in bindings:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.activated.connect(slot)
+            self._shortcuts.append(shortcut)
+
+    def _focus_search(self) -> None:
+        if self.view_name == "history":
+            self.history_search.setFocus()
+            self.history_search.selectAll()
+        else:
+            self.folder_field.setFocus()
+            self.folder_field.selectAll()
+
+    def _reveal_path(self, path: Path) -> None:
+        """Show *path* in the platform file manager (selecting the file when possible)."""
+        path = Path(path)
+        target = path if path.exists() else path.parent
+        try:
+            if sys.platform.startswith("win"):
+                if path.exists():
+                    subprocess.Popen(["explorer", "/select,", str(path)])
+                else:
+                    os.startfile(str(target))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", str(path)] if path.exists()
+                                 else ["open", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target)])
+        except Exception as exc:
+            logger.debug("could not reveal %s: %s", path, exc)
+            self._snack(f"Could not open the file manager: {exc}")
 
     # ================================================================== toast
     def _snack(self, message: str) -> None:
@@ -1876,6 +2634,421 @@ class MainWindow(QMainWindow):
             self, "Select your music folder", start if os.path.isdir(start) else "")
         if path:
             self.folder_field.setText(path)
+
+    def _add_files(self) -> None:
+        if self._running:
+            return
+        start = self.folder_field.text().strip()
+        patterns = " ".join(f"*{ext}" for ext in sorted(AUDIO_EXTENSIONS))
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Add audio files", start if os.path.isdir(start) else "",
+            f"Audio files ({patterns});;All files (*)")
+        if paths:
+            self._on_paths_dropped(paths)
+
+    # -------------------------------------------------------------------- queue
+    def _on_paths_dropped(self, paths: list[str]) -> None:
+        """Expand dropped folders on a worker thread, then fill the queue."""
+        if self._running:
+            self._snack("Stop the current sync before adding more tracks.")
+            return
+        raw_paths = [Path(os.path.expanduser(str(p))) for p in paths if str(p).strip()]
+        if not raw_paths:
+            return
+
+        def scan() -> list[Path]:
+            found: list[Path] = []
+            for entry in raw_paths:
+                if entry.is_dir():
+                    found.extend(discover_audio(entry, self.settings.recursive))
+                elif entry.is_file() and entry.suffix.lower() in AUDIO_EXTENSIONS:
+                    found.append(entry)
+            return found
+
+        job = Job(scan)
+        job.signals.done.connect(self._queue_add, Qt.QueuedConnection)
+        job.signals.error.connect(
+            lambda msg: self._snack(f"Could not read that folder: {msg}"), Qt.QueuedConnection)
+        self._start_job(job)
+
+    def _queue_add(self, files: Any) -> None:
+        if self._running:
+            self._snack("Stop the current sync before adding more tracks.")
+            return
+        existing = {str(path) for path in self.queue_paths}
+        added = 0
+        for entry in files or []:
+            path = Path(entry)
+            key = str(path)
+            if key in existing:
+                continue
+            existing.add(key)
+            self.queue_paths.append(path)
+            row = self.queue_table.rowCount()
+            self.queue_table.insertRow(row)
+            name = QTableWidgetItem(path.name)
+            name.setToolTip(key)
+            name.setData(Qt.UserRole, key)
+            status = QTableWidgetItem("Queued")
+            status.setData(Qt.UserRole, key)
+            status.setData(Qt.UserRole + 1, "queued")
+            status.setForeground(QColor(self._queue_status_color("queued")))
+            language = QTableWidgetItem("-")
+            language.setData(Qt.UserRole, key)
+            folder = QTableWidgetItem(path.parent.name or str(path.parent))
+            folder.setToolTip(str(path.parent))
+            folder.setData(Qt.UserRole, key)
+            for column, item in enumerate((name, status, language, folder)):
+                self.queue_table.setItem(row, column, item)
+            self.queue_rows[key] = row
+            added += 1
+        if added:
+            self._update_queue_count()
+            self._append_log("SYS", f"Added {added} track(s) to the queue.")
+        elif files:
+            self._snack("Those tracks are already queued.")
+
+    def _queue_find_row(self, key: str) -> int:
+        for row in range(self.queue_table.rowCount()):
+            item = self.queue_table.item(row, 0)
+            if item is not None and item.data(Qt.UserRole) == key:
+                return row
+        return -1
+
+    def _queue_set_status(self, path: Any, key: str, language: str = "") -> None:
+        key_path = str(path or "")
+        if not key_path or not hasattr(self, "queue_table"):
+            return
+        row = self._queue_find_row(key_path)
+        if row < 0:
+            return
+        label = QUEUE_STATUS.get(key, QUEUE_STATUS["queued"])[0]
+        item = self.queue_table.item(row, 1)
+        if item is not None:
+            item.setText(label)
+            item.setData(Qt.UserRole + 1, key)
+            item.setForeground(QColor(self._queue_status_color(key)))
+        if language:
+            lang_item = self.queue_table.item(row, 2)
+            if lang_item is not None:
+                lang_item.setText(language)
+        self._update_queue_count()
+
+    def _update_queue_count(self) -> None:
+        total = len(self.queue_paths)
+        if not total:
+            self.queue_count.setText("No tracks queued")
+            return
+        done = 0
+        for row in range(self.queue_table.rowCount()):
+            item = self.queue_table.item(row, 1)
+            if item is not None and item.data(Qt.UserRole + 1) == "done":
+                done += 1
+        suffix = f" · {done} done" if done else ""
+        self.queue_count.setText(f"{total} track(s){suffix}")
+
+    def _queue_selected_path(self) -> Optional[Path]:
+        items = self.queue_table.selectedItems()
+        if not items:
+            return None
+        row = items[0].row()
+        item = self.queue_table.item(row, 0)
+        raw = item.data(Qt.UserRole) if item is not None else None
+        return Path(raw) if raw else None
+
+    def _queue_selection_changed(self) -> None:
+        enabled = self._queue_selected_path() is not None and not self._running
+        for button in (self.queue_edit_btn, self.queue_location_btn, self.queue_remove_btn):
+            button.setEnabled(enabled)
+
+    def _queue_open_editor(self) -> None:
+        path = self._queue_selected_path()
+        if path is None:
+            self._snack("Select a queued track first.")
+            return
+        self._open_editor_for(path)
+
+    def _queue_open_location(self) -> None:
+        path = self._queue_selected_path()
+        if path is None:
+            self._snack("Select a queued track first.")
+            return
+        self._reveal_path(path)
+
+    def _queue_remove_selected(self) -> None:
+        if self._running:
+            return
+        path = self._queue_selected_path()
+        if path is None:
+            return
+        row = self._queue_find_row(str(path))
+        if row >= 0:
+            self.queue_table.removeRow(row)
+        self.queue_paths = [p for p in self.queue_paths if str(p) != str(path)]
+        self.queue_rows.pop(str(path), None)
+        self.queue_rows = {str(p): index for index, p in enumerate(self.queue_paths)}
+        self._update_queue_count()
+        self._queue_selection_changed()
+
+    def _queue_clear(self) -> None:
+        if self._running:
+            return
+        self.queue_table.setRowCount(0)
+        self.queue_paths.clear()
+        self.queue_rows.clear()
+        self._update_queue_count()
+        self._queue_selection_changed()
+
+    def _open_editor_for(self, path: Path) -> None:
+        path = Path(path)
+        if not path.exists():
+            self._snack("That file has moved or been deleted.")
+            return
+        text = ""
+        lrc_path = path.with_suffix(".lrc")
+        if lrc_path.exists():
+            try:
+                text = lrc_path.read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+        if not text:
+            try:
+                text = read_embedded_lyrics(path) or ""
+            except Exception:
+                text = ""
+        dialog = LyricEditorDialog(path, text, self.palette,
+                                   output_mode=self.settings.output_mode, parent=self)
+        dialog.saved.connect(self._on_lyrics_saved)
+        self.editor_dialog = dialog
+        dialog.exec()
+        self._reload_history()
+
+    # ----------------------------------------------------------- history & vault
+    def _reload_history(self) -> None:
+        if self.history_job_running:
+            self._history_pending = True
+            return
+        self.history_job_running = True
+        needle = self.history_search.text().strip()
+        status = self.history_filter.currentData() or "all"
+
+        def load() -> tuple[list[HistoryRecord], int, dict[str, QImage]]:
+            with LyricsDatabase(database_path()) as db:
+                records = db.history(search=needle, status=status, limit=400)
+                total = db.history_count(search=needle, status=status)
+            images: dict[str, QImage] = {}
+            for record in records:
+                if not record.thumbnail:
+                    continue
+                image = QImage.fromData(record.thumbnail, record.thumbnail_mime or None)
+                if not image.isNull():
+                    images[record.fingerprint] = image
+            return records, total, images
+
+        job = Job(load)
+
+        def done(result: Any) -> None:
+            self.history_job_running = False
+            records, total, images = result
+            self._render_history(records, total, images)
+            if self._history_pending:
+                self._history_pending = False
+                self._reload_history()
+
+        job.signals.done.connect(done, Qt.QueuedConnection)
+        job.signals.error.connect(self._history_failed, Qt.QueuedConnection)
+        self._start_job(job)
+
+    def _history_failed(self, message: str) -> None:
+        self.history_job_running = False
+        self.history_empty.setText(f"Could not read the library: {message}")
+        self.history_empty.setVisible(True)
+        self.history_list.setVisible(False)
+
+    def _artwork_placeholder(self) -> QPixmap:
+        if self._fallback_art is None or self._fallback_art.isNull():
+            self._fallback_art = _fallback_artwork(self.palette, 156)
+        return self._fallback_art
+
+    def _render_history(self, records: list[HistoryRecord], total: int,
+                        images: dict[str, QImage]) -> None:
+        self.history_entries = list(records)
+        self._history_images = images
+        self.history_list.clear()
+        placeholder = self._artwork_placeholder()
+        for record in records:
+            lines = [record.display_title, record.display_artist]
+            extra = " · ".join(part for part in (record.album, record.year) if part)
+            if extra:
+                lines.append(extra)
+            item = QListWidgetItem("\n".join(lines))
+            item.setData(Qt.UserRole, record.fingerprint)
+            item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
+            item.setToolTip(f"{record.path}\nStatus: {record.status}"
+                            + (f"\nSynced: {datetime.fromtimestamp(record.synced_at):%d %b %Y %H:%M}"
+                               if record.synced_at else ""))
+            image = images.get(record.fingerprint)
+            if image is not None and not image.isNull():
+                item.setIcon(QIcon(QPixmap.fromImage(image)))
+            else:
+                item.setIcon(QIcon(placeholder))
+            self.history_list.addItem(item)
+        empty = not records
+        self.history_empty.setText(
+            "No tracks match that search." if (empty and (self.history_search.text().strip()
+                                                          or (self.history_filter.currentData() or "all") != "all"))
+            else "No tracks yet - sync a folder or drop a few songs to build your library.")
+        self.history_empty.setVisible(empty)
+        self.history_list.setVisible(not empty)
+        self.history_count_label.setText(f"{total} track(s)" if total else "")
+        self._history_selection_changed()
+
+    def _history_selected(self) -> Optional[HistoryRecord]:
+        item = self.history_list.currentItem()
+        if item is None:
+            return None
+        fingerprint = item.data(Qt.UserRole)
+        for record in self.history_entries:
+            if record.fingerprint == fingerprint:
+                return record
+        return None
+
+    def _history_selection_changed(self) -> None:
+        enabled = self._history_selected() is not None
+        for button in (self.history_edit_btn, self.history_location_btn,
+                       self.history_resync_btn, self.history_export_btn):
+            button.setEnabled(enabled)
+
+    def _history_open_editor(self) -> None:
+        record = self._history_selected()
+        if record is None:
+            self._snack("Select a track from the library first.")
+            return
+        self._open_editor_for(Path(record.path))
+
+    def _history_open_location(self) -> None:
+        record = self._history_selected()
+        if record is None:
+            return
+        self._reveal_path(Path(record.path))
+
+    def _history_resync(self) -> None:
+        record = self._history_selected()
+        if record is None:
+            return
+        if self._running:
+            self._snack("Stop the current sync first.")
+            return
+        path = Path(record.path)
+        if not path.exists():
+            self._snack("That file has moved or been deleted - re-add it from the workspace.")
+            return
+        self._queue_clear()
+        self._queue_add([path])
+        self._show_view("workspace")
+        self._start_batch()
+
+    def _history_export(self) -> None:
+        record = self._history_selected()
+        if record is None:
+            return
+        path = Path(record.path)
+        text = ""
+        lrc_path = path.with_suffix(".lrc")
+        if lrc_path.exists():
+            try:
+                text = lrc_path.read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+        if not text and path.exists():
+            try:
+                text = read_embedded_lyrics(path) or ""
+            except Exception:
+                text = ""
+        if not text:
+            self._snack("No lyrics are stored for this track yet.")
+            return
+        target, _ = QFileDialog.getSaveFileName(
+            self, "Export .lrc", str(lrc_path), "LRC lyrics (*.lrc);;All files (*)")
+        if not target:
+            return
+        try:
+            write_text_atomic(Path(target), text)
+        except OSError as exc:
+            self._snack(f"Could not write the file: {exc}")
+            return
+        self._snack(f"Exported {Path(target).name}.")
+
+    # ------------------------------------------------------------------ updates
+    def _check_updates(self, manual: bool = False) -> None:
+        if self.update_checker is not None and self.update_checker.isRunning():
+            if manual:
+                self._snack("An update check is already running.")
+            return
+        self._update_manual = manual
+        repo = self.settings.update_repo
+        self.update_status.setText(f"Checking {repo} for updates…")
+        if manual:
+            self.check_updates_btn.setEnabled(False)
+        thread = UpdateCheckThread(__version__, repo, self)
+        thread.checked.connect(self._on_update_checked, Qt.QueuedConnection)
+        thread.finished.connect(self._on_update_thread_finished, Qt.QueuedConnection)
+        self.update_checker = thread
+        thread.start()
+
+    def _on_update_thread_finished(self) -> None:
+        if hasattr(self, "check_updates_btn"):
+            self.check_updates_btn.setEnabled(True)
+        checker = self.update_checker
+        if checker is not None and not checker.isRunning():
+            checker.deleteLater()
+            self.update_checker = None
+
+    def _on_update_checked(self, info: UpdateInfo) -> None:
+        self.update_info = info
+        manual = self._update_manual
+        self._update_manual = False
+        if not info.error:
+            self.settings.last_update_check = time.time()
+        self.update_status.setText(info.summary())
+        if info.error:
+            if manual:
+                self._snack(info.summary())
+            return
+        if info.available:
+            self.update_text.setText(
+                f"Lyricist v{info.latest} is available - you have v{info.current}.")
+            self.update_banner.setVisible(True)
+            self.update_badge.setText(f"Update available: v{info.latest}")
+            self.update_badge.setVisible(True)
+            self._append_log("SYS", info.summary())
+            if manual:
+                self._open_update_dialog()
+            else:
+                self._snack(f"Lyricist v{info.latest} is available.")
+        else:
+            self.update_banner.setVisible(False)
+            self.update_badge.setVisible(False)
+            if manual:
+                self._snack(info.summary())
+
+    def _open_update_dialog(self) -> None:
+        info = self.update_info
+        if info is None:
+            self._check_updates(manual=True)
+            return
+        if info.error or not info.available:
+            self._snack(info.summary())
+            return
+        UpdateDialog(info, self.palette, self).exec()
+
+    def _dismiss_update_banner(self) -> None:
+        self.update_banner.setVisible(False)
+        self.update_badge.setVisible(False)
+
+    def _toggle_auto_updates(self, checked: bool) -> None:
+        self.settings.auto_check_updates = bool(checked)
+        self._save_bg(self.settings.copy())
 
     def _select_output(self, mode: str) -> None:
         if self._running or mode == self.settings.output_mode:
@@ -2054,6 +3227,7 @@ class MainWindow(QMainWindow):
         s.tag_mode = self.tag_mode_settings.currentData() or "fill_missing"
         s.custom_providers = [p.normalised() for p in self.settings.custom_providers]
         s.last_folder = self.folder_field.text().strip()
+        s.auto_check_updates = self.sw_updates.isChecked()
         s._normalise()
         return s
 
@@ -2089,6 +3263,14 @@ class MainWindow(QMainWindow):
         self.sw_autotag.blockSignals(True)
         self.sw_autotag.setChecked(s.auto_tag)
         self.sw_autotag.blockSignals(False)
+        self.sw_updates.blockSignals(True)
+        self.sw_updates.setChecked(s.auto_check_updates)
+        self.sw_updates.blockSignals(False)
+        if s.last_update_check:
+            when = datetime.fromtimestamp(s.last_update_check).strftime("%d %b %Y %H:%M")
+            self.update_status.setText(f"Last checked {when} · {s.update_repo}")
+        else:
+            self.update_status.setText(f"Updates are checked against {s.update_repo}.")
         index = self.tag_mode_settings.findData(s.tag_mode)
         self.tag_mode_settings.setCurrentIndex(max(0, index))
         index = self.tag_mode_dd.findData(s.tag_mode)
@@ -2144,12 +3326,31 @@ class MainWindow(QMainWindow):
             return
         raw = self.folder_field.text().strip().strip('"').strip("'")
         folder = Path(os.path.expanduser(raw)) if raw else None
-        if folder is None or not folder.is_dir():
-            self._snack("Please choose an existing music folder first.")
+
+        queued = [path for path in self.queue_paths if path.is_file()]
+        missing = len(self.queue_paths) - len(queued)
+        target: Path | list[Path]
+        if queued:
+            target = queued
+            source_label = f"{len(queued)} queued track(s)"
+            last_folder = str(queued[0].parent)
+            if missing:
+                self._append_log("WARN", f"{missing} queued file(s) no longer exist and were "
+                                         "skipped.", "warning")
+        elif folder is not None and folder.is_dir():
+            target = folder
+            source_label = str(folder)
+            last_folder = str(folder)
+        elif folder is not None and folder.is_file() and folder.suffix.lower() in AUDIO_EXTENSIONS:
+            target = folder
+            source_label = str(folder)
+            last_folder = str(folder.parent)
+        else:
+            self._snack("Choose an existing music folder or drop a few tracks first.")
             return
 
         settings = self._collect_settings()
-        settings.last_folder = str(folder)
+        settings.last_folder = last_folder
         self.settings = settings
         self._save_bg(settings.copy())
         settings.apply_environment()
@@ -2165,10 +3366,11 @@ class MainWindow(QMainWindow):
         for label in self.stat_values.values():
             label.setText("0")
         self._set_running(True)
-        self._append_log("SYS", f"Starting sync of {folder}")
-        self._launch(folder, settings, None)
+        self._append_log("SYS", f"Starting sync of {source_label}")
+        self._launch(target, settings, None)
 
-    def _launch(self, target: Path, settings: Settings, lyrics: Optional[str]) -> None:
+    def _launch(self, target: Path | list[Path], settings: Settings,
+                lyrics: Optional[str]) -> None:
         worker = BatchWorker(target, settings, self.cancel, lyrics)
         worker.event.connect(self._on_event)
         worker.confirm.connect(self._on_confirm)
@@ -2258,6 +3460,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
         self.cancel.set()
+        checker = self.update_checker
+        if checker is not None and checker.isRunning():
+            checker.wait(600)
+            if checker.isRunning():      # last resort: never destroy a live QThread
+                checker.terminate()
+                checker.wait(1000)
         try:
             logging.getLogger("local_sync_lyrics").removeHandler(self._log_handler)
         except Exception:
@@ -2272,15 +3480,28 @@ class MainWindow(QMainWindow):
 # --------------------------------------------------------------------------- entry
 def run() -> int:
     """Create the QApplication, show the window and run the Qt event loop."""
+    if sys.platform == "win32":
+        try:  # taskbar grouping with the brand icon instead of the generic python.exe one
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                f"Lyricist.{__version__}")
+        except Exception:
+            pass
     QApplication.setApplicationName(APP_TITLE)
     QApplication.setOrganizationName(APP_TITLE)
+    QApplication.setApplicationVersion(__version__)
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    icon = asset_path("logo.png")
-    if icon is not None:
-        app.setWindowIcon(QIcon(str(icon)))
+    try:
+        app.setDesktopFileName("lyricist")
+    except Exception:
+        pass
+    icon = _app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
 
     store = SettingsStore()
     settings = store.load()

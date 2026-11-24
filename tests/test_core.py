@@ -562,7 +562,7 @@ def test_unwritable_target_is_a_failure_not_a_crash(tmp_path, monkeypatch):
 def test_gui_builds_and_pumps_events(window, tmp_path):
     from local_sync_lyrics import gui
 
-    assert window.stack.count() == 2
+    assert window.stack.count() == 4
 
     window._handle_event(Event("log", message="Searching LRCLIB…", tag="API"))
     window._handle_event(Event("progress", message="song.mp3", current=3, total=12))

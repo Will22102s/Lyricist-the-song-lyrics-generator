@@ -1,3 +1,5 @@
 """Lyricist - fetch or generate synced (.lrc) lyrics for a local music library."""
 
-__version__ = "2.2.0"
+from .config import __version__
+
+__all__ = ["__version__"]

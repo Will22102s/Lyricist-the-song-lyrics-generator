@@ -25,6 +25,7 @@ raised, and the write is verified by reading the tag back.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -554,3 +555,137 @@ def save_lyrics(path: Path, lrc_text: str, *, output_mode: str = "lrc",
         return SaveLyricsResult(False, embedded=embedded,
                                 message=embedded.message if embedded else "nothing was written")
     return SaveLyricsResult(True, wrote_lrc=wrote_lrc, embedded=embedded)
+
+
+# ==================================================================== artwork
+# Phase 4 - History & Library: read the embedded cover art so the media vault can
+# show real thumbnails instead of a generic placeholder.
+_ART_KEYS = {
+    "genre": ("genre", "TCON", "\xa9gen", "WM/Genre", "GENRE"),
+    "year": ("date", "year", "TDRC", "\xa9day", "WM/Year", "DATE", "YEAR"),
+    "language": ("language", "TLAN", "\xa9lan", "LANGUAGE"),
+}
+
+
+def read_extra_tags(path: Path) -> dict[str, str]:
+    """Album / genre / year / language for the history view (never raises)."""
+    result = {"album": "", "genre": "", "year": "", "language": ""}
+    try:
+        audio = _open_mutagen(path)
+    except Exception:
+        audio = None
+    if audio is None:
+        return result
+    tags = getattr(audio, "tags", None)
+    if not tags:
+        return result
+    result["album"] = _first_text(tags, _RAW_KEYS["album"])
+    for name, keys in _ART_KEYS.items():
+        value = _first_text(tags, keys)
+        if name == "year":
+            match = re.search(r"\d{4}", value)
+            value = match.group(0) if match else value[:4]
+        result[name] = value.strip()
+    return result
+
+
+def image_mime(data: bytes) -> str:
+    """Sniff a few common image signatures (PNG / JPEG / WebP / GIF / BMP)."""
+    if not data:
+        return ""
+    head = bytes(data[:16])
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if head.startswith(b"BM"):
+        return "image/bmp"
+    return "application/octet-stream"
+
+
+def read_artwork(path: Path) -> tuple[bytes, str]:
+    """Embedded cover art as ``(bytes, mime)``; ``(b'', '')`` when there is none."""
+    path = Path(path)
+    suffix = path.suffix.lower()
+    try:
+        if suffix in MP3_EXTENSIONS:
+            from mutagen.id3 import ID3, ID3NoHeaderError
+
+            try:
+                tags = ID3(str(path))
+            except ID3NoHeaderError:
+                return b"", ""
+            frames = tags.getall("APIC")
+            if frames:
+                frame = frames[0]
+                data = bytes(frame.data or b"")
+                return data, str(frame.mime or image_mime(data))
+            return b"", ""
+        if suffix in VORBIS_EXTENSIONS:
+            import base64
+
+            import mutagen
+
+            audio = mutagen.File(str(path))
+            pictures = getattr(audio, "pictures", None) or []
+            if pictures:
+                picture = pictures[0]
+                data = bytes(picture.data or b"")
+                return data, str(getattr(picture, "mime", "") or image_mime(data))
+            tags = getattr(audio, "tags", None)
+            if tags is not None:
+                for key in tags.keys():
+                    if str(key).upper() != "METADATA_BLOCK_PICTURE":
+                        continue
+                    values = tags[key]
+                    raw = values[0] if isinstance(values, list) else values
+                    try:
+                        from mutagen.flac import Picture
+
+                        picture = Picture(base64.b64decode(raw))
+                    except Exception:
+                        continue
+                    data = bytes(picture.data or b"")
+                    return data, str(getattr(picture, "mime", "") or image_mime(data))
+            return b"", ""
+        if suffix in MP4_EXTENSIONS:
+            from mutagen.mp4 import MP4, MP4Cover
+
+            tags = MP4(str(path)).tags
+            values = tags.get("covr") if tags else None
+            if values:
+                cover = values[0]
+                data = bytes(cover)
+                mime = "image/png" if getattr(cover, "imageformat", None) == MP4Cover.FORMAT_PNG \
+                    else "image/jpeg"
+                return data, mime
+            return b"", ""
+    except Exception as exc:  # damaged file / missing tag library
+        logger.debug("artwork read failed for %s: %s", path.name, exc)
+    return b"", ""
+
+
+def make_thumbnail(data: bytes, mime: str = "", *, max_size: int = 320) -> tuple[bytes, str]:
+    """Downscale *data* with Pillow when it is installed, else keep the original.
+
+    Pillow is an optional build/test dependency; the runtime never requires it.
+    """
+    if not data:
+        return b"", mime
+    try:
+        import io
+
+        from PIL import Image
+
+        with Image.open(io.BytesIO(data)) as image:
+            image = image.convert("RGB")
+            image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=86, optimize=True)
+            return buffer.getvalue(), "image/jpeg"
+    except Exception:
+        return data, mime or image_mime(data)

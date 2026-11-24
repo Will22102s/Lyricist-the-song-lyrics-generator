@@ -78,12 +78,76 @@ GUI log tags: `[API: Tier 1]`, `[API: Plain Text]`, `[Mashup Detected]`, `[AI: I
 
 Layered translucent glass over an ambient gradient: a dark (or frosted) plane, `rgba(...)`
 cards with a 1 px specular rim, 14–28 px corners and one accent colour. The whole look is
-one generated Qt Style Sheet (`theme.build_qss`), so a sidebar switches between **Sync
-Workspace** (library card, output-mode pills, stat tiles, activity log) and **Settings**
-with no restart; while a batch runs a tinted **floating progress card** appears above the
-stats with a gradient bar that follows each file. Hover / checked / disabled states come
-from QSS `:hover`, `:checked`, `:disabled` rules; the window is a native `QMainWindow`
-(no embedded browser, no Flutter runtime).
+one generated Qt Style Sheet (`theme.build_qss`), so the appearance can change with no
+restart. The window is **frameless** with a custom translucent title bar: native
+drag / double-click-to-maximise, minimise / maximise / close buttons, a drop shadow and
+OS-aware rounded corners. The sidebar switches between four icon-driven views with a short
+cross-fade (`QPropertyAnimation`):
+
+| View | Contents |
+|---|---|
+| **Sync Workspace** | drag-and-drop queue, library card, output-mode pills, live stat tiles, floating progress card, activity log |
+| **History & Library** | searchable cover-art grid of everything ever synced, with per-track actions |
+| **Providers & Rules** | smart pipeline, provider toggles, custom endpoints, tagging and batch rules |
+| **Settings & About** | appearance, local AI, updates, support links and hardware profile |
+
+While a batch runs a tinted **floating progress card** appears above the stats with a
+gradient bar that follows each file. Hover / checked / disabled states come from QSS
+`:hover`, `:checked`, `:disabled` rules; there is no embedded browser and no Flutter
+runtime.
+
+### Drag-and-drop queue
+
+Drop folders or individual `.mp3` / `.flac` / `.m4a` / `.wav` / `.ogg` / `.opus` files on
+the workspace, or use **Add files…**. Folders are scanned recursively on a worker thread
+(never the UI thread). Every row shows a live badge — *Queued*, *Isolating Vocals*,
+*Syncing*, *Auto-Tagging*, *Done*, *Error*, *Not Found* — plus the language Whisper locked
+onto for that track. Select a row for **Edit Lyrics**, **Open Location** or **Remove**;
+double-click opens the lyric editor. The queue is cleared or extended at any time, and
+**Start sync** processes exactly the queued files (or the folder in the field when the
+queue is empty).
+
+### History & Library
+
+The SQLite cache is upgraded in place (`SCHEMA_VERSION = 2`, idempotent `ALTER TABLE`
+migration — no existing record is lost) to store `file_path`, album, genre, year,
+language, output mode, provider, `synced_at` and a cached thumbnail. The **History &
+Library** view loads rows, thumbnails and decoded artwork on the thread pool, then shows a
+searchable / filterable grid. Real embedded artwork (`APIC`, FLAC/OGG `Picture` /
+`metadata_block_picture`, MP4 `covr`) is downscaled with Pillow when available; otherwise a
+branded placeholder is drawn. Select a tile for **Open in Lyric Editor**, **Open File
+Location** (Explorer `/select` on Windows, Finder `-R` on macOS, `xdg-open` elsewhere),
+**Re-Sync Track** or **Export .lrc**.
+
+### Updates & support
+
+`updater.py` checks `https://api.github.com/repos/<owner>/<repo>/releases/latest` on a
+background `QThread` at startup (when *Automatically check for updates* is on) or from
+**Check Now**. Versions are compared with `packaging.version` against the single
+`__version__` in `config.py`. A newer release shows a non-blocking banner with its
+changelog; the dialog opens the latest `.exe` / `.msi` / `.zip` / AppImage asset or the
+release page in the browser. Set `LYRICIST_NO_UPDATE_CHECK=1` to disable the check for a
+single run, or point `DEFAULT_UPDATE_REPO` / the `update_repo` setting at your own fork.
+
+**About & Support** shows the version, CPU / GPU / RAM summary, third-party credits
+(`faster-whisper`, CTranslate2, PySide6, mutagen, MusicBrainz, LRCLIB…) and configurable
+**GitHub Sponsors / Ko-fi / Buy Me a Coffee** buttons (`SUPPORT_LINKS` in `config.py`).
+
+### Keyboard shortcuts
+
+| Shortcut | Action |
+|---|---|
+| `Ctrl+O` | choose a music folder |
+| `Ctrl+Shift+O` | add individual audio files |
+| `Ctrl+R` | start / resume the queue |
+| `Ctrl+1` … `Ctrl+4` | Workspace · History · Providers · Settings |
+| `Ctrl+E` | edit the selected track's lyrics |
+| `Ctrl+F` | focus the library search (or the folder field) |
+| `Ctrl+U` | check for updates now |
+| `Ctrl+,` | open Settings |
+| `Esc` | stop the current batch |
+| `Ctrl+Q` | quit |
+
 
 **Settings → Appearance & Theme** (applies instantly, no restart, saved to `settings.json`):
 
@@ -218,29 +282,46 @@ Tokens are never copied from the environment into the file and are never logged.
 
 ```
 pip install -r requirements-dev.txt
-python build.py            # makes assets/logo.* if missing/stale, then PyInstaller -> ./dist
-python build.py --icons    # force-regenerate the icons first
+python build.py                  # one-folder build (instant start) -> dist/Lyricist/
+python build.py --onefile        # single executable (slower first launch)
+python build.py --clean          # wipe PyInstaller's cache first
+python build.py --icons          # force-regenerate the icons first
+python build.py --dry-run        # print the exact PyInstaller command, build nothing
 python make_icons.py --accent 1DB954   # (optional) the same logo in another colour
 ```
 
-`build.py` runs
-`python -m PyInstaller --noconfirm --clean --windowed --onedir --name Lyricist --add-data "assets:assets" --collect-all …`
-(`;` instead of `:` on Windows). If `audio-separator` / `langdetect` / `librosa` / `soundfile`
-are installed in the build environment they are bundled too (the first drags in PyTorch -
-expect a much larger package; leave it out of the build environment to keep the app small).
-`--icon` stamps the executable (Explorer, taskbar, title bar); `--add-data` ships `assets/`
-so the running app finds `logo.png` and its window icon. Output is `dist/Lyricist/`.
-`assets/logo.svg|png|ico` are committed; they are drawn by `local_sync_lyrics/branding.py`,
-so edit the geometry there and re-run `python main.py --make-icons`.
+`build.py` composes
+`python -m PyInstaller --noconfirm --windowed --onedir --name Lyricist --add-data "assets:assets" --collect-all …`
+(`;` instead of `:` on Windows) and adds:
+
+* **hidden imports** for `mutagen` (and its per-format modules), `audioread` and `PySide6`;
+* **`--collect-all`** for `faster_whisper`, `ctranslate2`, `onnxruntime` and `av` so their
+  native libraries / data files are found by static analysis;
+* **excludes** for the Qt modules the app never uses (`QtWebEngine*`, `Qt3D*`, `QtQuick`,
+  `QtQml`, `QtMultimedia`, `QtCharts`, `QtDesigner`, `QtTest`), which keeps the bundle
+  ~150–300 MB smaller and keeps Chromium out;
+* the right icon per platform: `assets/icon.ico` (Windows), `assets/icon.icns` (macOS),
+  `assets/icon.png` (Linux). `assets/logo.*` keeps the historical in-app names.
+
+If `audio-separator` / `langdetect` / `librosa` / `soundfile` are installed in the build
+environment they are bundled too (the first drags in PyTorch — expect a much larger
+package; leave it out of the build environment to keep the app small). Output is
+`dist/Lyricist/` (`--onedir`) or `dist/Lyricist` (`--onefile`). Build on the OS you are
+targeting; PyInstaller cannot cross-compile. `assets/logo.*` and `assets/icon.*` are
+committed; they are drawn by `local_sync_lyrics/branding.py`, so edit the geometry there
+and re-run `python main.py --make-icons`.
 
 ## Verification status — please read
 
-Verified in a Linux sandbox (Python 3.13, PySide6 6.12, faster-whisper 1.2.1, PyAV 19, mutagen): **261 tests** (95 original
-pipeline/GUI + 29 Liquid Glass UI + 104 for Phase 2 + 33 for Phase 3), the real Qt window built under the `offscreen` platform through
-both views, all five accents, dark/light/system, the "Your Own Lyrics" dialog, the mismatch dialog and a simulated
-batch, the PyInstaller command line assembled by `build.py`, a 60-seed noise sweep of the aligner, and an end-to-end
-offline run of the real pipeline (log tags, graceful degradation). The Phase 2 tests were mutation-checked (breaking the
-mismatch dialog, the `SYLT` frame, the language lock and the stem clean-up each makes a test fail).
+Verified in a Linux sandbox (Python 3.14, PySide6 6.12, faster-whisper 1.2.1, PyAV 19, mutagen): **278 tests**
+(95 original pipeline/GUI + 29 Liquid Glass UI + 104 for Phase 2 + 33 for Phase 3 + 17 for Phase 4),
+the real Qt window built under the `offscreen` platform through all four views, the queue and
+library grids, all five accents, dark/light/system, the "Your Own Lyrics" dialog, the mismatch
+dialog and a simulated batch, the PyInstaller command line assembled by `build.py` (`--onedir`,
+`--onefile`, `--clean`, `--dry-run`), a 60-seed noise sweep of the aligner, and an end-to-end
+offline run of the real pipeline (log tags, graceful degradation). The Phase 2 tests were
+mutation-checked (breaking the mismatch dialog, the `SYLT` frame, the language lock and the
+stem clean-up each makes a test fail).
 
 Phase 2 specifics: tags were written to **real MP3 / FLAC / Opus / M4A files** generated with PyAV and read back with mutagen
 (`SYLT` timestamps and language, ID3 v2.3 preserved, replace-not-stack, Unicode); the lyric matcher was run over 300 synthetic
@@ -258,6 +339,16 @@ custom providers were tested for URL quoting, LRC and JSON dot-path extraction, 
 round-trip; the MusicBrainz → Cover Art Archive → iTunes fallback, high-res artwork rewrite, cover sniffing (HTML and
 oversized payloads rejected) and genre merge were covered with canned payloads. A live CLI run (`--cli --auto-tag`)
 filled `TPE2`/`TRCK` from MusicBrainz and embedded the lyrics.
+
+Phase 4 specifics: a synthetic **v1 cache** is opened by the new `LyricsDatabase` and checked
+for row preservation, `file_path` / `synced_at` backfill and the added history columns;
+search/filter/count and “a later failure must not erase an earlier sync's artwork/metadata”
+are covered; embedded artwork is written to a **real MP3**, read back byte-for-byte and
+thumbnailed; the updater is exercised with a mocked GitHub payload (platform asset choice,
+changelog, semantic-version comparison) and a mocked HTTP 404; the four-view window, queue
+badges/language labels and the thumbnail grid are driven through real widgets; and both
+`build.py --dry-run` variants are checked for `--onedir`/`--onefile`, hidden imports, Qt
+excludes and the `assets` data argument.
 
 Aligner accuracy on **simulated** recognition errors (12 % misheard, 6 % dropped, 3 % hallucinated words),
 share of lines timestamped within 0.7 s of the truth, 80 random seeds:

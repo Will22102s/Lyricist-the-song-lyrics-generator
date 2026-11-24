@@ -1,4 +1,4 @@
 -r requirements.txt
 pyinstaller>=6.6
 pytest>=8.0
-pillow>=10.0          # make_icons.py / build.py: assets/logo.png + logo.ico
+pillow>=10.0          # make_icons.py / build.py + optional artwork thumbnails

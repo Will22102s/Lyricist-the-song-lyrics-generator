@@ -218,7 +218,7 @@ def test_window_starts_dark_apple_blue(window):
 
     assert window.palette.dark and window.palette.accent == "#0A84FF"
     assert window.settings.theme_mode == "dark"
-    assert window.stack.count() == 2
+    assert window.stack.count() == 4
     assert window.nav_buttons["workspace"].isChecked()
     assert "#0A84FF" in QApplication.instance().styleSheet().upper()
 

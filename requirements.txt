@@ -25,6 +25,7 @@ thefuzz>=0.22.0        # pulls in rapidfuzz (fast C implementation)
 
 # --- Metadata / system / console ---------------------------------------------
 mutagen>=1.47.0
+packaging>=23.0        # update checker: semantic version comparison
 psutil>=5.9
 rich>=13.0.0
 
