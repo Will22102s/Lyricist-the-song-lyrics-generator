@@ -33,7 +33,7 @@ pip install -r requirements-cpu.txt        # CPU wheels (recommended)
 pip install -r requirements-gpu.txt        # CUDA 12 wheels
 ```
 
-Python 3.10–3.13 recommended.  
+Python 3.10–3.14 recommended.  
 The GUI is **native Qt 6** (PySide6) — no Flutter/Flet runtime and no embedded browser.  
 FFmpeg must be available on `PATH` for audio decoding.  
 Pillow is optional: it sharpens history thumbnails and is required when building icons.
