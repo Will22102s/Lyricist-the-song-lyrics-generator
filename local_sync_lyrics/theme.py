@@ -312,6 +312,15 @@ QFrame#WindowFrame {{
     border: 1px solid {border};
     border-radius: 22px;
 }}
+/* Edge-to-edge when maximised / full screen: no rounded corners or outer gap. */
+QFrame#WindowFrame[maximised="true"] {{
+    border: none;
+    border-radius: 0px;
+}}
+QFrame#WindowFrame[maximised="true"] QFrame#TitleBar {{
+    border-top-left-radius: 0px;
+    border-top-right-radius: 0px;
+}}
 QFrame#TitleBar {{
     background: transparent;
     border: none;
@@ -597,10 +606,11 @@ QPushButton#Nav:checked {{
     font-weight: 600;
 }}
 QPushButton#Segment {{
-    background-color: {field};
-    color: {text2};
+    background-color: {glass_strong};
+    color: {text};
     border: 1px solid {field_border};
     border-radius: 13px;
+    min-height: 20px;
     padding: 10px 12px;
     font-size: 12.5px;
     font-weight: 600;
@@ -616,7 +626,7 @@ QPushButton#Segment:checked {{
     color: {text};
 }}
 QPushButton#Segment:disabled {{
-    color: {text3};
+    color: {text2};
 }}
 QPushButton#ModeSegment {{
     background-color: {field};
@@ -700,7 +710,7 @@ QTableWidget::item:selected {{
     color: {text};
 }}
 QHeaderView::section {{
-    background-color: {glass_strong};
+    background-color: {surface};
     color: {text2};
     border: none;
     border-bottom: 1px solid {border};
@@ -709,7 +719,7 @@ QHeaderView::section {{
     font-weight: 600;
 }}
 QTableCornerButton::section {{
-    background-color: {glass_strong};
+    background-color: {surface};
     border: none;
 }}
 QDialog#EditorDialog, QDialog#ProviderDialog {{
@@ -754,6 +764,11 @@ QCheckBox::indicator:hover {{
 QCheckBox::indicator:checked {{
     background-color: {accent};
     border: 1px solid {accent};
+    image: url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAA10lEQVR42u2Xyw7EIAhFkfT/f9nZTLpoqqACYnrPrpvJueXVIQIAAAAA+C4lo1Sttd6CpXQdObP823PqAC3ZXgg+fQY4+9s/IoAk3xtkPlmeiOhKu98F8RQVaL19rfzWABby6ks8chkj5VUVGL2MXutyKsDMZZyVn60s7+751bbkiFbwkhcDSD+uCeEpr6rASghveXULlT9Wm8VKfngGRkJY7nrTIdaEiJJf+k+8s21M1qiXUOgh04bwDLt8iSU570qZfEq0JCPazOxb6CmbZUYAAAAA4MkPhtB8OOaURJUAAAAASUVORK5CYII=");
+}}
+QCheckBox::indicator:checked:disabled {{
+    background-color: {text3};
+    border: 1px solid {text3};
 }}
 QCheckBox:disabled {{
     color: {text3};

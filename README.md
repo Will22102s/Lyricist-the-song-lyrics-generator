@@ -278,7 +278,7 @@ workflow file.
 ## Project Status
 
 Verified in a Linux sandbox (Python 3.14, PySide6 6.12, faster-whisper 1.2.1, PyAV 19, mutagen):
-**278 automated tests** covering the full pipeline, GUI, theme system, forced alignment, tag
+**284 automated tests** covering the full pipeline, GUI, theme system, forced alignment, tag
 writing, vocal isolation, language locking, “Your Own Lyrics” matching, lyric editor, custom
 providers, auto-tagging + cover art, and the Phase 4 history / updater / packaging work. The
 real Qt window was built under the `offscreen` platform through all four views, the queue and

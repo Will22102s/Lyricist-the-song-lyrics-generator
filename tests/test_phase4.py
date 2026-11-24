@@ -85,6 +85,45 @@ def test_history_search_filter_and_upsert_preserves_metadata(tmp_path):
         assert record.synced_at == 10.0
 
 
+def test_same_file_path_replaces_an_older_fingerprint(tmp_path):
+    from local_sync_lyrics.database import LyricsDatabase, TrackRecord
+
+    with LyricsDatabase(tmp_path / "cache.db") as db:
+        db.upsert(TrackRecord("before-tags", "/m/song.mp3", "synced_online",
+                              title="Song", synced_at=10.0, thumbnail=b"cover",
+                              thumbnail_mime="image/png"))
+        # Embedding tags changes the file content, hence the fingerprint.  The
+        # history grid must still show one card, not two.
+        db.upsert(TrackRecord("after-tags", "/m/song.mp3", "synced_online",
+                              title="Song", synced_at=20.0))
+        rows = db.history()
+        assert len(rows) == 1
+        assert rows[0].fingerprint == "after-tags"
+        stored = db.get("after-tags")
+        assert stored is not None and stored.attempts == 2
+        assert stored.thumbnail == b"cover"      # artwork survives the replace
+
+
+def test_legacy_duplicate_paths_are_collapsed_on_open(tmp_path):
+    from local_sync_lyrics.database import LyricsDatabase, TrackRecord
+
+    path = tmp_path / "cache.db"
+    with LyricsDatabase(path) as db:
+        db.upsert(TrackRecord("old", "/m/song.mp3", "synced_online",
+                              title="Old", synced_at=10.0))
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO tracks (fingerprint, path, title, status, synced_at, updated_at) "
+        "VALUES ('new', '/m/song.mp3', 'New', 'synced_online', 20.0, 20.0)")
+    conn.commit()
+    conn.close()
+
+    with LyricsDatabase(path) as db:
+        rows = db.history()
+    assert len(rows) == 1
+    assert rows[0].title == "New"
+
+
 # ---------------------------------------------------------------------- artwork
 def _png_bytes() -> bytes:
     from PIL import Image
@@ -201,6 +240,42 @@ def test_window_has_four_icon_views_and_switch_animation(window, qapp):
         assert not window.nav_buttons[name].icon().isNull()
 
 
+def test_nav_labels_show_ampersands_literally(window):
+    expected = {
+        "workspace": "Sync Workspace",
+        "history": "History & Library",
+        "providers": "Providers & Rules",
+        "settings": "Settings & About",
+    }
+    for name, label in expected.items():
+        # ``&&`` is how Qt renders one literal ampersand in widget text.
+        assert window.nav_buttons[name].text().strip() == label.replace("&", "&&")
+
+
+def test_workspace_action_rows_keep_their_natural_height(window, qapp):
+    # The workspace is inside a scroll area, so the layout can no longer squeeze
+    # button text down to a few pixels.
+    for button in window.output_buttons.values():
+        assert button.text().strip()
+        assert button.height() >= 38
+    for button in (window.queue_edit_btn, window.queue_location_btn,
+                   window.queue_remove_btn):
+        assert button.text().strip()
+        assert button.height() >= 30
+
+
+def test_maximised_window_drops_rounded_corners_and_margins(window, qapp):
+    window._toggle_maximised()
+    qapp.processEvents()
+    assert window.isMaximized()
+    assert window.window_frame.property("maximised") is True
+    assert window._root_layout.contentsMargins().left() == 0
+    window._toggle_maximised()
+    qapp.processEvents()
+    assert window.window_frame.property("maximised") is False
+    assert window._root_layout.contentsMargins().left() > 0
+
+
 def test_queue_badges_language_and_clear(window, tmp_path, qapp):
     first = tmp_path / "first.mp3"
     second = tmp_path / "second.flac"
@@ -278,6 +353,40 @@ def test_history_view_renders_embedded_thumbnail(window, tmp_path, qapp):
     assert window.history_count_label.text().startswith("1")
 
 
+def test_history_lazily_reads_and_caches_embedded_cover_art(window, tmp_path, qapp):
+    from audio_fixtures import make_audio
+    from local_sync_lyrics.app_paths import database_path
+    from local_sync_lyrics.database import LyricsDatabase, TrackRecord
+    from local_sync_lyrics.metadata import write_tags
+    from local_sync_lyrics.models import TrackMetadata
+
+    song = tmp_path / "tagged.mp3"
+    if not make_audio(song):
+        pytest.skip("this PyAV build has no MP3 encoder")
+    png = _png_bytes()
+    result = write_tags(song, TrackMetadata(title="Tagged", artist="Artist"),
+                        cover=png, cover_mime="image/png")
+    if not (result.ok and result.cover_written):
+        pytest.skip("this build cannot embed cover art")
+
+    with LyricsDatabase(database_path()) as db:
+        db.upsert(TrackRecord(
+            "lazy-cover", str(song), "synced_online", artist="Artist", title="Tagged",
+            synced_at=time.time()))          # no thumbnail stored yet
+
+    window._reload_history()
+    deadline = time.time() + 8
+    while time.time() < deadline and window.history_list.count() == 0:
+        qapp.processEvents()
+        time.sleep(0.02)
+    assert window.history_list.count() == 1
+    assert not window.history_list.item(0).icon().isNull()
+    with LyricsDatabase(database_path()) as db:
+        cached = db.get("lazy-cover")
+    assert cached is not None and cached.thumbnail
+    assert cached.thumbnail_mime == "image/jpeg"
+
+
 def test_settings_round_trip_for_update_preferences(tmp_path):
     from local_sync_lyrics.config import DEFAULT_UPDATE_REPO, Settings
 
@@ -323,8 +432,12 @@ def test_qss_covers_the_phase4_shell():
     qss = theme.build_qss(theme.build_palette(True))
     for selector in ("QFrame#WindowFrame", "QFrame#TitleBar", "QPushButton#TitleButton",
                      "QFrame#DropZone", "QListWidget#HistoryGrid",
-                     "QFrame#UpdateBanner", "QLabel#DropGlyph"):
+                     "QFrame#UpdateBanner", "QLabel#DropGlyph",
+                     'QFrame#WindowFrame[maximised="true"]',
+                     "QCheckBox::indicator:checked"):
         assert selector in qss
+    checked = qss.split("QCheckBox::indicator:checked", 1)[1]
+    assert "data:image/png;base64," in checked.split("}", 1)[0]
 
 
 # ------------------------------------------------------------------- packaging

@@ -426,7 +426,7 @@ def test_startup_probe_reports_the_isolation_backend(window, monkeypatch):
     assert ta._wait_for(lambda: window.isolation_ready is False)
     assert "unavailable" in window.isolation_status.text()
     assert "audio-separator" in window.isolate_hint.text()
-    assert not window.banner.isHidden()
+    assert window.banner.isHidden()          # inline hint replaces the old banner
 
 
 def test_language_event_shows_and_clears_the_badge(window):

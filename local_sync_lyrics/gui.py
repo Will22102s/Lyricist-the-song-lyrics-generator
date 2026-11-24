@@ -35,12 +35,12 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from PySide6.QtCore import (
-    QEasingCurve, QObject, QPointF, QProcess, QPropertyAnimation, QRunnable, QRectF, QSize,
-    Qt, QThread, QThreadPool, QTimer, QUrl, Signal, Slot,
+    QEasingCurve, QEvent, QObject, QPointF, QProcess, QPropertyAnimation, QRunnable, QRectF,
+    QSize, Qt, QThread, QThreadPool, QTimer, QUrl, Signal, Slot,
 )
 from PySide6.QtGui import (
     QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QImage, QKeySequence,
-    QPainter, QPen, QPixmap, QShortcut, QTextCharFormat, QTextCursor,
+    QPainter, QPainterPath, QPen, QPixmap, QShortcut, QTextCharFormat, QTextCursor,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog,
@@ -66,7 +66,7 @@ from .lrc_utils import (
     LrcLine, compose_lrc, format_timestamp, parse_timestamp, repair_lrc, split_lrc,
     write_text_atomic,
 )
-from .metadata import read_embedded_lyrics, save_lyrics
+from .metadata import make_thumbnail, read_artwork, read_embedded_lyrics, save_lyrics
 from .models import Event
 from .processor import AUDIO_EXTENSIONS, BatchProcessor, discover_audio
 from .theme import (
@@ -286,6 +286,11 @@ def _button(text: str, name: str = "Glass", *, checkable: bool = False) -> QPush
     button.setCursor(Qt.PointingHandCursor)
     button.setCheckable(checkable)
     return button
+
+
+def _qt_text(text: str) -> str:
+    """Escape ``&`` so Qt shows it literally instead of treating it as a mnemonic."""
+    return text.replace("&", "&&")
 
 
 def _hline(*items: Any, spacing: int = 10) -> QHBoxLayout:
@@ -1484,7 +1489,7 @@ class MainWindow(QMainWindow):
         self.nav_group.setExclusive(True)
         self.nav_buttons: dict[str, QPushButton] = {}
         for key, text, icon_kind in VIEWS:
-            button = _button(f"  {text}", "Nav", checkable=True)
+            button = _button(f"  {_qt_text(text)}", "Nav", checkable=True)
             button.setIconSize(QSize(20, 20))
             button.setProperty("iconKind", icon_kind)
             button.clicked.connect(lambda _=False, k=key: self._show_view(k))
@@ -1601,6 +1606,9 @@ class MainWindow(QMainWindow):
         output_row.setSpacing(8)
         for mode in OUTPUT_MODES:
             button = _button(OUTPUT_MODE_LABELS[mode], "Segment", checkable=True)
+            button.setMinimumHeight(42)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            button.setToolTip(OUTPUT_MODE_LABELS[mode])
             button.clicked.connect(lambda _=False, m=mode: self._select_output(m))
             self.output_group.addButton(button)
             self.output_buttons[mode] = button
@@ -1615,7 +1623,7 @@ class MainWindow(QMainWindow):
         isolate_row.addWidget(self.isolate_hint)
         isolate_row.addStretch(1)
 
-        self.sw_autotag = QCheckBox("Auto-tag & cover art")
+        self.sw_autotag = QCheckBox(_qt_text("Auto-tag & cover art"))
         self.sw_autotag.toggled.connect(self._toggle_autotag)
         self.tag_mode_dd = QComboBox()
         for mode in TAG_MODES:
@@ -1674,6 +1682,8 @@ class MainWindow(QMainWindow):
         self.queue_remove_btn = _button("Remove", "Danger")
         self.queue_remove_btn.clicked.connect(self._queue_remove_selected)
         for button in (self.queue_edit_btn, self.queue_location_btn, self.queue_remove_btn):
+            button.setMinimumHeight(34)
+            button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
             button.setEnabled(False)
             queue_actions.addWidget(button)
         queue_actions.addStretch(1)
@@ -1770,10 +1780,22 @@ class MainWindow(QMainWindow):
         self.log_view.setObjectName("Log")
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(MAX_LOG_LINES)
+        self.log_view.setMinimumHeight(140)
         self.log_view.setFont(QFont("DejaVu Sans Mono", 10))
         log_card = self._card(_vbox(log_header, self.log_view, spacing=8), strong=True)
         box.addWidget(log_card, 1)
-        return page
+
+        # The workspace has more content than fits on a 1280x800 screen.  Without a
+        # scroll area the QVBoxLayout squeezes every row - which clipped button text
+        # and made the output-mode/queue actions look blank.  Let the page keep its
+        # natural height and scroll vertically instead.
+        scroll = QScrollArea()
+        scroll.setObjectName("PageScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(page)
+        return scroll
 
     # ----------------------------------------------------------------- settings
     def _build_settings(self) -> QWidget:
@@ -2302,13 +2324,14 @@ class MainWindow(QMainWindow):
             self.isolation_ready = report.isolation_ready
             if report.isolation_ready:
                 self.isolation_status.setText(f"Vocal isolation: ready ({report.backend}).")
-                self.banner.setVisible(False)
+                self.isolate_hint.setText("Slower - best for dense or noisy mixes")
             else:
                 reason = report.isolation_reason()
                 self.isolation_status.setText(f"Vocal isolation: unavailable - {reason}.")
                 self.isolate_hint.setText(f"Unavailable - {reason}")
-                self.banner_text.setText(report.warning())
-                self.banner.setVisible(True)
+            # Keep the workspace calm: the inline hint next to the disabled switch is
+            # enough.  The old top-of-page warning banner is intentionally not shown.
+            self.banner.setVisible(False)
             for line in report.summary_lines():
                 self._append_log("SYS", line)
             self._refresh_custom_options()
@@ -2562,17 +2585,46 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- window chrome
     def _toggle_maximised(self) -> None:
-        maximised = not self.isMaximized()
-        if maximised:
-            self.showMaximized()
-        else:
+        if self.isMaximized() or self.isFullScreen():
             self.showNormal()
+        else:
+            self.showMaximized()
+
+    def _sync_window_chrome(self) -> None:
+        """Match the frameless frame to the current window state.
+
+        Floating windows keep the 18 px shadow gutter and 22 px rounded corners;
+        maximised / full-screen windows drop both so the app reaches the screen
+        edges instead of showing dark corner gaps.
+        """
+        maximised = self.isMaximized() or self.isFullScreen()
+        if not hasattr(self, "_root_layout"):
+            return
         margin = 0 if maximised else SHADOW_MARGIN
         self._root_layout.setContentsMargins(margin, margin, margin, margin)
         if self._shadow is not None:
             self._shadow.setEnabled(not maximised)
         if hasattr(self, "size_grip"):
             self.size_grip.setVisible(not maximised)
+        if hasattr(self, "window_frame"):
+            self.window_frame.setProperty("maximised", maximised)
+            widgets = [self.window_frame]
+            title_bar = getattr(self, "title_bar", None)
+            if title_bar is not None:
+                widgets.append(title_bar)
+            for widget in widgets:
+                style = widget.style()
+                style.unpolish(widget)
+                style.polish(widget)
+                widget.update()
+        title_bar = getattr(self, "title_bar", None)
+        if title_bar is not None and hasattr(title_bar, "max_btn"):
+            title_bar.max_btn.setToolTip("Restore" if maximised else "Maximise")
+
+    def changeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange:
+            self._sync_window_chrome()
 
     def _install_shortcuts(self) -> None:
         bindings: tuple[tuple[str, Callable[[], Any]], ...] = (
@@ -2847,13 +2899,28 @@ class MainWindow(QMainWindow):
             with LyricsDatabase(database_path()) as db:
                 records = db.history(search=needle, status=status, limit=400)
                 total = db.history_count(search=needle, status=status)
-            images: dict[str, QImage] = {}
-            for record in records:
-                if not record.thumbnail:
-                    continue
-                image = QImage.fromData(record.thumbnail, record.thumbnail_mime or None)
-                if not image.isNull():
-                    images[record.fingerprint] = image
+                images: dict[str, QImage] = {}
+                for record in records:
+                    data = record.thumbnail
+                    mime = record.thumbnail_mime
+                    if not data and record.path:
+                        # Older rows were written before artwork was cached (or were
+                        # synced when the file had no tags).  Read the embedded cover
+                        # once and store it so the grid is instant next time.
+                        try:
+                            raw, raw_mime = read_artwork(Path(record.path))
+                            if raw:
+                                data, mime = make_thumbnail(raw, raw_mime)
+                                if data:
+                                    db.set_thumbnail(record.fingerprint, data, mime)
+                        except Exception:
+                            logger.debug("history artwork failed for %s",
+                                         record.path, exc_info=True)
+                    if not data:
+                        continue
+                    image = QImage.fromData(data, mime or None)
+                    if not image.isNull():
+                        images[record.fingerprint] = image
             return records, total, images
 
         job = Job(load)
@@ -2881,6 +2948,28 @@ class MainWindow(QMainWindow):
             self._fallback_art = _fallback_artwork(self.palette, 156)
         return self._fallback_art
 
+    def _history_cover(self, image: QImage, size: int = 156) -> QPixmap:
+        """Square, rounded album tile: fill the square and centre-crop the overflow."""
+        source = QPixmap.fromImage(image)
+        if source.isNull():
+            return self._artwork_placeholder()
+        scaled = source.scaled(size, size, Qt.KeepAspectRatioByExpanding,
+                               Qt.SmoothTransformation)
+        x = max(0, (scaled.width() - size) // 2)
+        y = max(0, (scaled.height() - size) // 2)
+        cropped = scaled.copy(x, y, size, size)
+        tile = QPixmap(size, size)
+        tile.fill(Qt.transparent)
+        painter = QPainter(tile)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(0, 0, size, size), 18, 18)
+        painter.setClipPath(clip)
+        painter.drawPixmap(0, 0, cropped)
+        painter.end()
+        return tile
+
     def _render_history(self, records: list[HistoryRecord], total: int,
                         images: dict[str, QImage]) -> None:
         self.history_entries = list(records)
@@ -2900,7 +2989,7 @@ class MainWindow(QMainWindow):
                                if record.synced_at else ""))
             image = images.get(record.fingerprint)
             if image is not None and not image.isNull():
-                item.setIcon(QIcon(QPixmap.fromImage(image)))
+                item.setIcon(QIcon(self._history_cover(image)))
             else:
                 item.setIcon(QIcon(placeholder))
             self.history_list.addItem(item)

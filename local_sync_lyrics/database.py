@@ -230,6 +230,44 @@ class LyricsDatabase:
             )
         except sqlite3.Error as exc:  # pragma: no cover - defensive
             logger.debug("history backfill skipped: %s", exc)
+        LyricsDatabase._dedupe_paths(conn)
+
+    @staticmethod
+    def _dedupe_paths(conn: sqlite3.Connection) -> None:
+        """Collapse historical duplicates that share a file path.
+
+        Fingerprints are content based, so embedding tags changes them.  Older
+        builds inserted a second row for the same file in that case; keep the
+        newest / successfully synced row and delete the rest.
+        """
+        try:
+            rows = conn.execute(
+                "SELECT rowid, COALESCE(NULLIF(file_path, ''), path) AS key, "
+                "synced_at, updated_at FROM tracks"
+            ).fetchall()
+        except sqlite3.Error as exc:  # pragma: no cover - defensive
+            logger.debug("history dedupe skipped: %s", exc)
+            return
+        best: dict[str, tuple[tuple[float, float, float, int], int]] = {}
+        for row in rows:
+            key = row["key"] or ""
+            if not key:
+                continue
+            score = (1.0 if (row["synced_at"] or 0) > 0 else 0.0,
+                     float(row["synced_at"] or 0.0), float(row["updated_at"] or 0.0),
+                     int(row["rowid"]))
+            if key not in best or score > best[key][0]:
+                best[key] = (score, int(row["rowid"]))
+        keep = {rowid for _, rowid in best.values()}
+        stale = [int(row["rowid"]) for row in rows if (row["key"] or "") and
+                 int(row["rowid"]) not in keep]
+        if not stale:
+            return
+        try:
+            conn.executemany("DELETE FROM tracks WHERE rowid=?", ((rowid,) for rowid in stale))
+            logger.info("Removed %d duplicate history row(s)", len(stale))
+        except sqlite3.Error as exc:  # pragma: no cover - defensive
+            logger.debug("history dedupe delete skipped: %s", exc)
 
     def _quarantine(self) -> None:
         try:
@@ -311,19 +349,55 @@ class LyricsDatabase:
 
         Empty values never erase data that is already there (a later failure
         record must not wipe the album art of an earlier successful sync), and
-        an empty ``synced_at`` keeps the previous timestamp.
+        an empty ``synced_at`` keeps the previous timestamp.  Rows are keyed by
+        content fingerprint *and* by file path: re-syncing a file whose tags
+        changed (and therefore got a new fingerprint) replaces the old row
+        instead of adding a duplicate card to History & Library.
         """
         with self._lock:
             if self._conn is None:
                 return
             try:
+                carry = None
+                if record.path:
+                    # A stale row for the same file under an older fingerprint.
+                    carry = self._conn.execute(
+                        """
+                        SELECT fingerprint, attempts, thumbnail, thumbnail_mime,
+                               synced_at, album, genre, year, language, duration
+                        FROM tracks
+                        WHERE (path=? OR file_path=?) AND fingerprint<>?
+                        ORDER BY (synced_at>0) DESC, synced_at DESC, updated_at DESC
+                        LIMIT 1
+                        """,
+                        (record.path, record.path, record.fingerprint),
+                    ).fetchone()
+                    if carry is not None:
+                        self._conn.execute(
+                            "DELETE FROM tracks WHERE (path=? OR file_path=?) "
+                            "AND fingerprint<>?",
+                            (record.path, record.path, record.fingerprint),
+                        )
                 previous = self._conn.execute(
-                    "SELECT attempts FROM tracks WHERE fingerprint=?", (record.fingerprint,)
+                    "SELECT attempts, thumbnail, thumbnail_mime, synced_at, album, "
+                    "genre, year, language, duration "
+                    "FROM tracks WHERE fingerprint=?", (record.fingerprint,)
                 ).fetchone()
-                attempts = (previous["attempts"] + 1) if previous else 1
-                synced_at = record.synced_at
+                base = previous or carry
+                attempts = (int(base["attempts"] or 0) + 1) if base is not None else 1
+                synced_at = record.synced_at or (float(base["synced_at"] or 0.0)
+                                                 if base is not None else 0.0)
                 if not synced_at and record.status in SYNCED_STATUSES:
                     synced_at = time.time()
+                thumbnail = record.thumbnail or (base["thumbnail"] if base is not None else b"")
+                thumbnail_mime = record.thumbnail_mime or (
+                    base["thumbnail_mime"] if base is not None else "")
+                album = record.album or (base["album"] if base is not None else "")
+                genre = record.genre or (base["genre"] if base is not None else "")
+                year = record.year or (base["year"] if base is not None else "")
+                language = record.language or (base["language"] if base is not None else "")
+                duration = record.duration if record.duration is not None else (
+                    base["duration"] if base is not None else None)
                 self._conn.execute(
                     """
                     INSERT INTO tracks (fingerprint, path, file_path, artist, title, album,
@@ -371,11 +445,11 @@ class LyricsDatabase:
                     """,
                     (
                         record.fingerprint, record.path, record.path, record.artist,
-                        record.title, record.album, record.genre, record.year,
-                        record.language, record.duration, record.status, record.source,
-                        record.lrc_path, record.output_mode, record.provider_used,
-                        synced_at, int(record.ai_tried), record.error[:500], attempts,
-                        time.time(), record.thumbnail or b"", record.thumbnail_mime,
+                        record.title, album, genre, year, language, duration,
+                        record.status, record.source, record.lrc_path, record.output_mode,
+                        record.provider_used, synced_at, int(record.ai_tried),
+                        record.error[:500], attempts, time.time(),
+                        thumbnail or b"", thumbnail_mime,
                     ),
                 )
             except sqlite3.Error as exc:
