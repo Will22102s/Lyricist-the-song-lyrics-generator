@@ -2529,6 +2529,12 @@ class MainWindow(QMainWindow):
 
     def _animate_view(self, view: QWidget) -> None:
         """Short cross-fade when switching pages (native effects only, no blocking)."""
+        previous = self._view_anim
+        if previous is not None:
+            try:
+                previous.stop()
+            except RuntimeError:      # already deleted by Qt
+                pass
         effect = QGraphicsOpacityEffect(view)
         effect.setOpacity(0.0)
         view.setGraphicsEffect(effect)
@@ -2541,12 +2547,17 @@ class MainWindow(QMainWindow):
         def finish() -> None:
             try:
                 view.setGraphicsEffect(None)
-            except Exception:
+            except RuntimeError:
                 pass
-            self._view_anim = None
+            if self._view_anim is anim:
+                self._view_anim = None
+            anim.deleteLater()
 
         anim.finished.connect(finish)
-        anim.start(QPropertyAnimation.DeleteWhenStopped)
+        # The window owns the animation; deleteLater() in ``finish`` avoids the
+        # DeleteWhenStopped wrapper/QObject ownership mismatch that Qt reports as
+        # "shared QObject was deleted directly" at interpreter shutdown.
+        anim.start()
         self._view_anim = anim
 
     # ------------------------------------------------------------- window chrome
@@ -3460,6 +3471,13 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
         self.cancel.set()
+        anim = self._view_anim
+        if anim is not None:
+            try:
+                anim.stop()
+            except RuntimeError:      # already deleted by Qt
+                pass
+            self._view_anim = None
         checker = self.update_checker
         if checker is not None and checker.isRunning():
             checker.wait(600)
