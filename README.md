@@ -263,9 +263,9 @@ version tag and the workflow runs the test suite, builds on `windows-latest` and
 attaches both files to that tag's GitHub Release:
 
 ```bash
-git tag -a v2.3.0 -m "Lyricist 2.3.0"
+git tag -a v2.3.1 -m "Lyricist 2.3.1"
 git push origin phase-4
-git push origin v2.3.0
+git push origin v2.3.1
 ```
 
 Use **Run workflow** (manual dispatch) to produce the two archives as downloadable

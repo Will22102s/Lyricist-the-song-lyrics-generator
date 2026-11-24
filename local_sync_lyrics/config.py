@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 # The single source of truth for the application version.  ``local_sync_lyrics``
 # re-exports it, ``build.py`` stamps it into the bundle and the updater compares
 # GitHub release tags against it.
-__version__ = "2.3.0"
+__version__ = "2.3.1"
 
 # --- updates & support ---------------------------------------------------------------
 # Change these two constants (or the setting in Settings) to point the in-app
