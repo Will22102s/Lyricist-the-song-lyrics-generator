@@ -585,6 +585,61 @@ QPushButton#Quiet {{
 QPushButton#Quiet:hover {{
     background-color: {glass_hi};
 }}
+/* Lyric editor toolbar - explicit, compact tool buttons. */
+QPushButton#EditorTool {{
+    background-color: {glass};
+    color: {text};
+    border: 1px solid {border};
+    border-radius: 10px;
+    padding: 8px 14px;
+    font-size: 12.5px;
+    font-weight: 600;
+}}
+QPushButton#EditorTool:hover {{
+    background-color: {glass_hi};
+    border-color: {border_hi};
+}}
+QPushButton#EditorTool:disabled {{
+    color: {text3};
+    background-color: {field};
+    border-color: {field_border};
+}}
+QPushButton#EditorDanger {{
+    background-color: {glass};
+    color: {err};
+    border: 1px solid {qss_color(with_alpha(p.err, 0.45))};
+    border-radius: 10px;
+    padding: 8px 14px;
+    font-size: 12.5px;
+    font-weight: 600;
+}}
+QPushButton#EditorDanger:hover {{
+    background-color: {qss_color(with_alpha(p.err, 0.16))};
+    border-color: {err};
+}}
+QPushButton#EditorDanger:disabled {{
+    color: {text3};
+    background-color: {field};
+    border-color: {field_border};
+}}
+QPushButton#EditorAccent {{
+    background-color: {accent_soft};
+    color: {text};
+    border: 1px solid {qss_color(with_alpha(p.accent, 0.55))};
+    border-radius: 10px;
+    padding: 8px 14px;
+    font-size: 12.5px;
+    font-weight: 600;
+}}
+QPushButton#EditorAccent:hover {{
+    background-color: {qss_color(with_alpha(p.accent, 0.24))};
+    border-color: {accent};
+}}
+QPushButton#EditorAccent:disabled {{
+    color: {text3};
+    background-color: {field};
+    border-color: {field_border};
+}}
 QPushButton#Nav {{
     background-color: transparent;
     color: {text2};
@@ -674,6 +729,17 @@ QLineEdit:disabled, QPlainTextEdit:disabled, QTextEdit:disabled, QComboBox:disab
 }}
 QLineEdit[error="true"] {{
     border: 1px solid {err};
+}}
+/* Opaque inline editor: the translucent field colour let the old cell text
+   show through while typing, which looked like overlapping lyrics. */
+QLineEdit#CellEditor {{
+    background-color: {surface};
+    color: {text};
+    border: 1px solid {accent};
+    border-radius: 7px;
+    padding: 3px 6px;
+    selection-background-color: {accent};
+    selection-color: {on_accent};
 }}
 QPlainTextEdit#Log {{
     background-color: {log_bg};

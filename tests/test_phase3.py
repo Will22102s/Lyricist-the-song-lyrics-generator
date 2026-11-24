@@ -459,6 +459,35 @@ def test_editor_reports_invalid_timestamps_without_saving(editor, qapp):
     assert "not a mm:ss.xx timestamp" in dialog.status.text()
 
 
+def test_editor_normalises_loose_timestamps_after_a_cell_edit(editor, qapp):
+    dialog, _ = editor
+    dialog.table.item(0, 0).setText("0:9.5")
+    qapp.processEvents()
+    assert dialog.table.item(0, 0).text() == "00:09.50"
+
+
+def test_editor_clean_and_format_sorts_and_drops_duplicate_times(editor, qapp):
+    dialog, _ = editor
+    dialog.table.item(0, 0).setText("00:09.00")
+    dialog._append_row(9.0, "A longer duplicate line")
+    dialog._clean_and_format()
+    qapp.processEvents()
+    rows = [(dialog.table.item(r, 0).text(), dialog.table.item(r, 1).text())
+            for r in range(dialog.table.rowCount())]
+    assert rows == [("00:04.25", "my old friend"),
+                    ("00:09.00", "A longer duplicate line")]
+    assert "Removed 1 duplicate" in dialog.status.text()
+
+
+def test_editor_toolbar_uses_self_explanatory_labels(editor):
+    dialog, _ = editor
+    assert "Insert Line Below" in dialog.insert_btn.text()
+    assert "Delete Selected Line" in dialog.delete_btn.text()
+    assert "Shift Timestamps" in dialog.shift_btn.text()
+    assert "Clean & Auto-Format" in dialog.clean_btn.text()
+    assert dialog.validate_btn is dialog.clean_btn
+
+
 def test_custom_providers_dialog_adds_toggles_and_deletes(qapp):
     from local_sync_lyrics.gui import CustomProviderForm, CustomProvidersDialog
     from local_sync_lyrics.theme import build_palette

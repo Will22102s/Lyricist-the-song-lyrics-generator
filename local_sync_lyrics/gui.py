@@ -48,7 +48,8 @@ from PySide6.QtWidgets import (
     QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
     QPushButton, QScrollArea, QSizeGrip, QSizePolicy, QSpinBox, QStackedWidget,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QStyleOptionViewItem, QStyledItemDelegate, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
 from . import __version__
@@ -596,6 +597,101 @@ def _stamp_text(seconds: float) -> str:
     return format_timestamp(seconds).strip("[]")
 
 
+class LyricCellDelegate(QStyledItemDelegate):
+    """Single-line, opaque editor for the lyric table.
+
+    Qt's default editor inherits the translucent field background, so the old cell
+    text can show through while typing.  This delegate uses the opaque surface
+    colour, selects the existing value on open and canonicalises timestamps when
+    the edit is committed.
+    """
+
+    def createEditor(self, parent: QWidget, option: QStyleOptionViewItem,
+                     index) -> QLineEdit:  # noqa: N802 - Qt API
+        editor = QLineEdit(parent)
+        editor.setObjectName("CellEditor")      # opaque surface, see theme.py
+        editor.setFrame(False)
+        editor.setClearButtonEnabled(False)
+        editor.setTextMargins(2, 0, 2, 0)
+        return editor
+
+    def setEditorData(self, editor: QLineEdit, index) -> None:  # noqa: N802 - Qt API
+        editor.setText(str(index.data(Qt.EditRole) or ""))
+        editor.selectAll()
+
+    def setModelData(self, editor: QLineEdit, model, index) -> None:  # noqa: N802 - Qt API
+        value = editor.text().replace("\r", " ").replace("\n", " ").strip()
+        if index.column() == 0:
+            seconds = parse_timestamp(value)
+            if seconds is not None:              # normalise 1:2.5 -> 01:02.50
+                value = _stamp_text(seconds)
+        model.setData(index, value, Qt.EditRole)
+
+    def updateEditorGeometry(self, editor: QLineEdit, option: QStyleOptionViewItem,
+                             index) -> None:  # noqa: N802 - Qt API
+        editor.setGeometry(option.rect.adjusted(1, 1, -1, -1))
+
+    def initStyleOption(self, option: QStyleOptionViewItem, index) -> None:  # noqa: N802
+        super().initStyleOption(option, index)
+        option.textElideMode = Qt.ElideRight
+
+
+class ShiftTimestampsDialog(QDialog):
+    """Small modal used by the editor's “Shift Timestamps” tool."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("EditorDialog")
+        self.setWindowTitle("Shift all timestamps")
+        self.setMinimumWidth(430)
+        self.delta_ms = 0
+
+        box = QVBoxLayout(self)
+        box.setContentsMargins(22, 20, 22, 18)
+        box.setSpacing(12)
+        box.addWidget(_label("Shift all timestamps", "Title"))
+        box.addWidget(_label(
+            "Move every timed line forward or backward. Negative values move earlier.",
+            "Caption", wrap=True))
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.spin = QSpinBox()
+        self.spin.setRange(-60_000, 60_000)
+        self.spin.setSingleStep(50)
+        self.spin.setSuffix(" ms")
+        self.spin.setValue(0)
+        self.spin.setMinimumWidth(150)
+        self.spin.setToolTip("Use a negative value to move lyrics earlier")
+        row.addWidget(_label("Offset", "SectionLabel"))
+        row.addWidget(self.spin, 1)
+        box.addLayout(row)
+
+        quick = QHBoxLayout()
+        quick.setSpacing(6)
+        for value in (-1000, -500, -250, 250, 500, 1000):
+            button = _button(f"{value:+d}", "EditorTool")
+            button.setToolTip(f"Set the offset to {value:+d} ms")
+            button.clicked.connect(lambda _=False, v=value: self.spin.setValue(v))
+            quick.addWidget(button)
+        box.addLayout(quick)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(10)
+        buttons.addStretch(1)
+        cancel = _button("Cancel", "EditorTool")
+        cancel.clicked.connect(self.reject)
+        apply_btn = _button("Apply Shift", "Primary")
+        apply_btn.clicked.connect(self.accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(apply_btn)
+        box.addLayout(buttons)
+
+    def accept(self) -> None:  # noqa: N802 - Qt API
+        self.delta_ms = self.spin.value()
+        super().accept()
+
+
 class LyricEditorDialog(QDialog):
     """Review / edit / re-time lyrics, then write them back (Phase 3).
 
@@ -642,51 +738,56 @@ class LyricEditorDialog(QDialog):
 
         toolbar = QHBoxLayout()
         toolbar.setSpacing(8)
-        self.insert_btn = _button("Insert Line", "Glass")
+        self.insert_btn = _button("+ Insert Line Below", "EditorTool")
+        self.insert_btn.setToolTip("Insert a blank lyric line below the selected row")
         self.insert_btn.clicked.connect(self._insert_row)
-        self.delete_btn = _button("Delete Line", "Danger")
+        self.delete_btn = _button("✕ Delete Selected Line", "EditorDanger")
+        self.delete_btn.setToolTip("Remove the highlighted lyric line(s)")
         self.delete_btn.clicked.connect(self._delete_rows)
-        self.shift_spin = QSpinBox()
-        self.shift_spin.setRange(10, 10_000)
-        self.shift_spin.setSingleStep(50)
-        self.shift_spin.setValue(100)
-        self.shift_spin.setSuffix(" ms")
-        self.shift_spin.setFixedWidth(110)
-        self.shift_back = _button("Shift -", "Glass")
-        self.shift_back.clicked.connect(lambda: self._shift(-self.shift_spin.value()))
-        self.shift_fwd = _button("Shift +", "Glass")
-        self.shift_fwd.clicked.connect(lambda: self._shift(self.shift_spin.value()))
-        self.validate_btn = _button("Validate Timestamps", "Quiet")
-        self.validate_btn.clicked.connect(self._validate)
-        toolbar.addWidget(self.insert_btn)
-        toolbar.addWidget(self.delete_btn)
-        toolbar.addSpacing(8)
-        toolbar.addWidget(self.shift_back)
-        toolbar.addWidget(self.shift_spin)
-        toolbar.addWidget(self.shift_fwd)
-        toolbar.addWidget(self.validate_btn)
+        self.shift_btn = _button("⏱ Shift Timestamps…", "EditorTool")
+        self.shift_btn.setToolTip("Move every timestamp forward or backward by a chosen offset")
+        self.shift_btn.clicked.connect(self._open_shift_dialog)
+        self.clean_btn = _button("✨ Clean & Auto-Format", "EditorAccent")
+        self.clean_btn.setToolTip(
+            "Sort lines chronologically, fix timestamp syntax and remove duplicates")
+        self.clean_btn.clicked.connect(self._clean_and_format)
+        for button in (self.insert_btn, self.delete_btn, self.shift_btn, self.clean_btn):
+            button.setMinimumHeight(36)
+            button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+            toolbar.addWidget(button)
         toolbar.addStretch(1)
         box.addLayout(toolbar)
+        self.validate_btn = self.clean_btn        # backwards-compatible name
 
         self.table = QTableWidget(0, 2)
+        self.table.setObjectName("LyricTable")
         self.table.setHorizontalHeaderLabels(["Timestamp [mm:ss.xx]", "Lyric line"])
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(34)
+        self.table.verticalHeader().setMinimumSectionSize(30)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed
                                    | QAbstractItemView.AnyKeyPressed)
+        self.table.setWordWrap(False)                 # one clean line per lyric
+        self.table.setTextElideMode(Qt.ElideRight)
+        self.table.setVerticalScrollMode(QAbstractItemView.ScrollPerItem)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.table.setMinimumHeight(220)
+        self.table.setItemDelegate(LyricCellDelegate(self.table))
+        self.table.itemChanged.connect(self._on_item_changed)
         header_view = self.table.horizontalHeader()
         header_view.setSectionResizeMode(0, QHeaderView.Fixed)
         header_view.setSectionResizeMode(1, QHeaderView.Stretch)
-        self.table.setColumnWidth(0, 160)
-        self.table.itemChanged.connect(lambda *_: None)
+        self.table.setColumnWidth(0, 170)
 
         self.raw_view = QPlainTextEdit()
         self.raw_view.setObjectName("RawLrc")
         self.raw_view.setPlaceholderText("[00:12.34]A lyric line")
 
         self.stack = QStackedWidget()
+        self.stack.setMinimumHeight(240)
         self.stack.addWidget(self.table)
         self.stack.addWidget(self.raw_view)
         box.addWidget(self.stack, 1)
@@ -803,19 +904,61 @@ class LyricEditorDialog(QDialog):
             message += f" {problems} invalid timestamp(s) were left alone."
         self._set_status(message, ok=not problems)
 
-    def _validate(self) -> None:
+    def _open_shift_dialog(self) -> None:
+        """Ask for an offset, then move every timestamp by it."""
+        dialog = ShiftTimestampsDialog(self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        if dialog.delta_ms == 0:
+            self._set_status("Offset is 0 ms - nothing to shift.", ok=True)
+            return
+        self._shift(dialog.delta_ms)
+
+    def _clean_and_format(self) -> None:
+        """Sort chronologically, repair bracket syntax and drop duplicate times."""
         text, problems = self._current_text()
         fixed, repair_problems = repair_lrc(text)
         header, lines = split_lrc(fixed)
-        self._load_lines(lines)
+        kept: dict[int, LrcLine] = {}
+        order: list[int] = []
+        for line in lines:
+            key = int(round(line.time * 100))
+            previous = kept.get(key)
+            if previous is None:
+                kept[key] = line
+                order.append(key)
+            elif len(line.text.strip()) > len(previous.text.strip()):
+                kept[key] = line            # keep the more descriptive duplicate
+        cleaned = [kept[key] for key in order]
+        removed = len(lines) - len(cleaned)
+        if header:
+            self._header = header
+        self._load_lines(cleaned)
         if self.raw_toggle.isChecked():
-            self.raw_view.setPlainText(compose_lrc(header, lines))
-        if problems or repair_problems:
-            shown = "; ".join((problems + repair_problems)[:4])
-            self._set_status(f"Could not time {len(problems + repair_problems)} line(s): {shown}",
-                             ok=False)
-        else:
-            self._set_status(f"All {len(lines)} timestamps are valid and sorted.", ok=True)
+            self.raw_view.setPlainText(compose_lrc(self._header, cleaned))
+        skipped = len(problems + repair_problems)
+        parts = [f"Cleaned {len(cleaned)} line(s)."]
+        if removed:
+            parts.append(f"Removed {removed} duplicate timestamp(s).")
+        if skipped:
+            parts.append(f"Skipped {skipped} untimed line(s).")
+        self._set_status(" ".join(parts), ok=not skipped)
+
+    def _on_item_changed(self, item: QTableWidgetItem) -> None:
+        """Canonicalise a timestamp the moment a cell edit is committed."""
+        if item is None or item.column() != 0:
+            return
+        seconds = parse_timestamp(item.text())
+        if seconds is None:
+            return
+        canonical = _stamp_text(seconds)
+        if canonical != item.text():
+            self.table.blockSignals(True)
+            item.setText(canonical)
+            self.table.blockSignals(False)
+
+    def _validate(self) -> None:                # kept for older callers
+        self._clean_and_format()
 
     def _toggle_raw(self, raw: bool) -> None:
         self.insert_btn.setEnabled(not raw)
@@ -841,9 +984,8 @@ class LyricEditorDialog(QDialog):
 
     # ------------------------------------------------------------------- save
     def _set_busy(self, busy: bool) -> None:
-        for widget in (self.insert_btn, self.delete_btn, self.shift_back, self.shift_fwd,
-                       self.shift_spin, self.validate_btn, self.raw_toggle, self.cancel_btn,
-                       self.table, self.raw_view):
+        for widget in (self.insert_btn, self.delete_btn, self.shift_btn, self.clean_btn,
+                       self.raw_toggle, self.cancel_btn, self.table, self.raw_view):
             widget.setEnabled(not busy)
         self.save_btn.setEnabled(not busy)
         self.save_btn.setText("Saving…" if busy else "Save && Apply")
