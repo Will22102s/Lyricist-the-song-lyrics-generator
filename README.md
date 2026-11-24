@@ -254,6 +254,25 @@ targeting; PyInstaller cannot cross-compile. `assets/logo.*` and `assets/icon.*`
 committed; they are drawn by `local_sync_lyrics/branding.py`, so edit the geometry there
 and re-run `python main.py --make-icons`.
 
+### Automated release builds
+
+`.github/workflows/release.yml` builds both desktop targets on GitHub runners. Push a
+version tag and the workflow runs the test suite, builds on `windows-latest` and
+`ubuntu-latest`, packages `dist/Lyricist/` as
+`Lyricist-<version>-windows-x64.zip` / `Lyricist-<version>-linux-x86_64.tar.gz`, and
+attaches both files to that tag's GitHub Release:
+
+```bash
+git tag -a v2.3.0 -m "Lyricist 2.3.0"
+git push origin phase-4
+git push origin v2.3.0
+```
+
+Use **Run workflow** (manual dispatch) to produce the two archives as downloadable
+artifacts without creating a release. The tag must point at a commit that contains the
+workflow file.
+
+
 ---
 
 ## Project Status
