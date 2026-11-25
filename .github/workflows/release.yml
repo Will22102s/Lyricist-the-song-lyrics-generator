@@ -1,6 +1,6 @@
 name: Release
 
-# Push a version tag (e.g. `git push origin v2.3.1`) to build the Windows and
+# Push a version tag (e.g. `git push origin v2.3.2`) to build the Windows and
 # Linux apps and attach both archives to that GitHub Release.  Run the workflow
 # manually to produce downloadable artifacts without publishing a release.
 on:
