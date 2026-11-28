@@ -300,7 +300,7 @@ drag-and-drop event is delivered to the drop zone.
 - Live responses from every external provider  
 - Real vocal separation with actual model weights  
 - Real-world Whisper accuracy on heavily produced or layered tracks  
-- Windows/macOS packaging and native window-icon behaviour (the Linux build was verified)  
+- Windows packaging and native window-icon behaviour (the Linux build was verified)  
 - A real GitHub release download / in-app self-update (the check and payload handling are mocked)  
 
 The ≥ 40 % alignment quality gate and the 35 % “Your Own Lyrics” similarity threshold exist specifically to prevent low-confidence results from being written.
