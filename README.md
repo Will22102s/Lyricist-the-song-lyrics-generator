@@ -2,7 +2,7 @@
 
 *(Formerly “Local Sync Lyrics”. The Python package is still named `local_sync_lyrics`. On first launch this version automatically migrates your old `LocalSyncLyrics` settings, cache, and model folders to `Lyricist`.)*
 
-Desktop application for **Windows, Linux and macOS** that generates high-quality **synced lyrics** — as standalone `.lrc` files, embedded tags inside the audio file, or both.
+Desktop application for **Windows and Linux** that generates high-quality **synced lyrics** — as standalone `.lrc` files, embedded tags inside the audio file, or both.
 
 It follows a clear priority order: **search first → listen second → guess last**.
 
